@@ -30,20 +30,19 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # 2. FETCH SETTINGS FROM YOUR WORDPRESS PLUGIN
 # ---------------------------------------------------------------------------
 def get_wp_settings():
-    endpoint = f"{WP_SITE_URL}/wp-json/sarkari-ai/v1/settings"
     try:
-        response = requests.get(endpoint, timeout=10, verify=False)
+        # Fetch dynamic settings from WordPress site
+        response = requests.get("https://sarkarijobsguide.in/wp-json/sarkari-ai/v1/settings", timeout=10)
         if response.status_code == 200:
-            print("✅ WordPress settings endpoint reachable!")
             return response.json()
     except Exception as e:
-        print(f"❌ Error fetching WP settings: {e}")
-    
+        print(f"⚠️ Error fetching WP settings: {e}")
+
+    # Fallback default settings if WordPress API fails
     return {
         "max_age_days": 7,
         "post_status": "draft",
         "target_urls": [
-            "target_urls": [
             "https://ssc.gov.in/",
             "https://www.ibps.in/careers/",
             "https://tpsc.tripura.gov.in/advertisement",
