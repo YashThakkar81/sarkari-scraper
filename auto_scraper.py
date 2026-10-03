@@ -19,7 +19,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ---------------------------------------------------------------------------
 WP_SITE_URL = "https://sarkarijobsguide.in"
 WP_USERNAME = "yashthakkar81@gmail.com"
-WP_APP_PASSWORD = "wROu XuCa YNm1 aC5k ah1B zBq9"  # Paste your WordPress Application Password here
+WP_APP_PASSWORD = "x3Gi 5gKg WuHp YnWI K56d xiXy"  # Paste your WordPress Application Password here
 
 GEMINI_API_KEY = "AQ.Ab8RN6LyR03t9eBaZX6cQMuX-yxLOv3bfSN8KJ_qPKyIKUcb_A"            # Paste your Gemini API key here
 
