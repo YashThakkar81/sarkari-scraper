@@ -1,228 +1,712 @@
+#!/usr/bin/env python3
+"""
+Sarkari Jobs Guide - Auto Notification Drafter
+----------------------------------------------
+Scans government recruitment pages -> finds PDFs -> Gemini extracts details ->
+creates a WordPress post (draft by default) with JobPosting JSON-LD.
 
+Setup:
+    pip install requests beautifulsoup4 google-genai urllib3
+
+Set credentials as environment variables (recommended):
+    WP_USERNAME, WP_APP_PASSWORD, GEMINI_API_KEY
+Optional:
+    GEMINI_MODEL   -> force a specific model, e.g. gemini-3.6-flash
+    MAX_PDFS_PER_PAGE (default 5)
+"""
+
+import io
 import os
 import re
+import sys
 import json
+import ssl
+import time
+import random
+import hashlib
+import logging
+from datetime import datetime, timedelta
+from urllib.parse import urljoin, urlparse
+
 import requests
 import urllib3
+from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
 from google import genai
 from google.genai import types
 
-# Disable SSL warning popups for government portals with self-signed SSL certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ---------------------------------------------------------------------------
-# 1. CONFIGURATION & CREDENTIALS
+# 1. CONFIGURATION
 # ---------------------------------------------------------------------------
 WP_SITE_URL = "https://sarkarijobsguide.in"
-WP_USERNAME = "yashthakkar81@gmail.com"
-WP_APP_PASSWORD = "x3Gi 5gKg WuHp YnWI K56d xiXy"  # Paste your WordPress Application Password here
+WP_USERNAME = os.environ.get("WP_USERNAME", "yashthakkar81@gmail.com")
+WP_APP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "x3Gi 5gKg WuHp YnWI K56d xiXy")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6LyR03t9eBaZX6cQMuX-yxLOv3bfSN8KJ_qPKyIKUcb_A")
 
-GEMINI_API_KEY = "AQ.Ab8RN6LyR03t9eBaZX6cQMuX-yxLOv3bfSN8KJ_qPKyIKUcb_A"            # Paste your Gemini API key here
+SEEN_FILE = "seen_notifications.json"
+REVIEW_LOG = "needs_review.log"
+MAX_PDFS_PER_PAGE = int(os.environ.get("MAX_PDFS_PER_PAGE", "5"))
+INLINE_PDF_LIMIT = 18 * 1024 * 1024      # above this, use the Gemini Files API
+MAX_PDF_SIZE = 45 * 1024 * 1024          # skip anything bigger
+DEFAULT_MAX_AGE_DAYS = 7
 
-# Initialize Gemini Client
+# Models are tried in this order. gemini-3.8-flash (used earlier) does not exist,
+# which made every call fail. Check https://ai.google.dev/gemini-api/docs/models
+MODEL_CANDIDATES = [m for m in [
+    os.environ.get("GEMINI_MODEL"),
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash",
+    "gemini-flash-latest",
+] if m]
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s",
+                    datefmt="%H:%M:%S")
+log = logging.getLogger("sarkari-bot")
+
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+
+class FatalError(Exception):
+    """Problem that makes continuing pointless (bad key, bad WP login...)."""
+
+
+class TransientError(Exception):
+    """Temporary problem; the item is NOT marked as seen so it retries next run."""
+
+
 # ---------------------------------------------------------------------------
-# 2. FETCH SETTINGS FROM YOUR WORDPRESS PLUGIN
+# 2. SETTINGS FROM WORDPRESS PLUGIN (with fallback)
 # ---------------------------------------------------------------------------
+FALLBACK_SETTINGS = {
+    "max_age_days": DEFAULT_MAX_AGE_DAYS,
+    "post_status": "draft",
+    "target_urls": [
+        "https://ssc.gov.in/",
+        "https://www.ibps.in/careers/",
+        "https://tpsc.tripura.gov.in/advertisement",
+        "https://appsc.gov.in/Index/sub_page/doc2195/Advertisements",
+        "https://mppsc.mp.gov.in/Advertisement",
+        "https://psc.uk.gov.in/candidate-corner/recruitment",
+        "https://rpsc.rajasthan.gov.in/advertisements",
+        "https://uppsc.up.nic.in/CandidatePages/Notifications.aspx",
+        "https://gpsc.goa.gov.in/advertisements/",
+        "https://mpscmanipur.gov.in/whats_new.html",
+        "https://spsc.sikkim.gov.in/Advertisement.html",
+        "https://gpsc.gujarat.gov.in/dashboard?stage=Advertisement",
+        "https://www.jpsc.gov.in/",
+        "https://www.opsc.gov.in/Public/OPSC/Default.aspx",
+        "https://psc.cg.gov.in/htm/Advertisement%20-%20Latest.htm",
+        "https://hpsc.gov.in/en-us/Instructions",
+        "https://ppsc.gov.in/Advertisement/openadv.aspx?id=1",
+        "https://www.upsc.gov.in/recruitment/recruitment-advertisement",
+        "https://hppsc.hp.gov.in/CommonControls/ViewContinuousLinkPage?qs=mhlKjiXMMItGo46f60VBXX8%2B1SQ83OzVLj9MfDScpvboDSdMygkK4iLV47Bu%2FJzMpJLanI%2BihrK9p8W6JsSQUgHTy39NyiuO%BFtbEmiPQyc%3D",
+        "https://apsc.nic.in/advt_2026.php#advertisement",
+        "https://mpsc.mizoram.gov.in/category/notifications",
+        "https://www.ossc.gov.in/Public/OSSC/Default.aspx",
+        "https://www.hssc.gov.in/advertisement",
+        "https://ladakh.gov.in/recruitment-corner/",
+        "https://lakshadweep.gov.in/notice_category/recruitment/",
+        "https://dpar.py.gov.in/Exam/Recruitment/Recruitment.htm",
+        "https://dnh.gov.in/notice_category/job/",
+        "https://ddd.gov.in/#1600945272016-0a6a909f-83cb",
+        "https://ddd.gov.in/notice-category/Recruitments/",
+        "https://northmiddle.andaman.nic.in/past-notices/recruitment/",
+        "https://andamannicobar.gov.in/vacancy_all",
+        "https://ssbodisha.ac.in/advertisement/",
+        "https://rsmssb.rajasthan.gov.in/page?menuName=EJwE/Y7GD1hMok0YfKTFOtUJMJFGLBa;455611;jbRgWtRe9q4=",
+        "https://sssc.uk.gov.in/recruitment-notification/",
+        "https://dsssb.delhi.gov.in/",
+        "https://gsssb.gujarat.gov.in/Notification",
+        "https://rssb.rajasthan.gov.in/advertisements",
+        "https://upsssc.gov.in/AllNotifications.aspx",
+        "https://bankofbaroda.bank.in/career/current-opportunities",
+        "https://www.southindianbank.bank.in/",
+        "https://sbi.bank.in/web/careers/current-openings",
+        "https://www.idbi.bank.in/idbi-bank-careers-current-openings.aspx",
+        "https://rajcrb.rajasthan.gov.in/RecruitmentAdvertisements.aspx?menu_id=13",
+        "https://www.nhb.org.in/oppurtunitiesnhb/",
+        "https://opportunities.rbi.org.in/Scripts/Vacancies.aspx",
+        "https://pnb.bank.in/Recruitments.aspx",
+        "https://bankofindia.bank.in/career/recruitment-notice",
+        "https://www.canarabank.bank.in/pages/career",
+        "https://www.nainitalbank.bank.in/en/Careers/careerslist",
+        "https://www.nabard.org/careers-notices1.aspx?cid=693&id=26",
+        "https://www.epfo.gov.in/recruitments/",
+        "https://licindia.in/en/web/guest/careers",
+        "https://esic.gov.in/recruitments",
+        "https://jkb.bank.in/career",
+    ],
+}
+
+
 def get_wp_settings():
-    endpoint = f"{WP_SITE_URL}/wp-json/sarkari-ai/v1/settings"
     try:
-        response = requests.get(endpoint, timeout=10, verify=False)
-        if response.status_code == 200:
-            print("✅ WordPress settings endpoint reachable!")
-            return response.json()
-    except Exception as e:
-        print(f"❌ Error fetching WP settings: {e}")
-    
-    return {
-        "max_age_days": 7,
-        "post_status": "draft",
-        "target_urls": [
-            "https://ssc.gov.in/",
-            "https://www.ibps.in/careers/",
-            "https://tpsc.tripura.gov.in/advertisement",
-            "https://appsc.gov.in/Index/sub_page/doc2195/Advertisements",
-            "https://mppsc.mp.gov.in/Advertisement",
-            "https://psc.uk.gov.in/candidate-corner/recruitment",
-            "https://rpsc.rajasthan.gov.in/advertisements",
-            "https://uppsc.up.nic.in/CandidatePages/Notifications.aspx",
-            "https://gpsc.goa.gov.in/advertisements/",
-            "https://mpscmanipur.gov.in/whats_new.html",
-            "https://spsc.sikkim.gov.in/Advertisement.html",
-            "https://gpsc.gujarat.gov.in/dashboard?stage=Advertisement",
-            "https://www.jpsc.gov.in/",
-            "https://www.opsc.gov.in/Public/OPSC/Default.aspx",
-            "https://psc.cg.gov.in/htm/Advertisement%20-%20Latest.htm",
-            "https://hpsc.gov.in/en-us/Instructions",
-            "https://ppsc.gov.in/Advertisement/openadv.aspx?id=1",
-            "https://www.upsc.gov.in/recruitment/recruitment-advertisement",
-            "https://hppsc.hp.gov.in/CommonControls/ViewContinuousLinkPage?qs=mhlKjiXMMItGo46f60VBXX8%2B1SQ83OzVLj9MfDScpvboDSdMygkK4iLV47Bu%2FJzMpJLanI%2BihrK9p8W6JsSQUgHTy39NyiuO%BFtbEmiPQyc%3D",
-            "https://apsc.nic.in/advt_2026.php#advertisement",
-            "https://mpsc.mizoram.gov.in/category/notifications",
-            "https://www.ossc.gov.in/Public/OSSC/Default.aspx",
-            "https://www.hssc.gov.in/advertisement",
-            "https://ladakh.gov.in/recruitment-corner/",
-            "https://lakshadweep.gov.in/notice_category/recruitment/",
-            "https://dpar.py.gov.in/Exam/Recruitment/Recruitment.htm",
-            "https://dnh.gov.in/notice_category/job/",
-            "https://ddd.gov.in/#1600945272016-0a6a909f-83cb",
-            "https://ddd.gov.in/notice-category/Recruitments/",
-            "https://northmiddle.andaman.nic.in/past-notices/recruitment/",
-            "https://andamannicobar.gov.in/vacancy_all",
-            "https://ssbodisha.ac.in/advertisement/",
-            "https://rsmssb.rajasthan.gov.in/page?menuName=EJwE/Y7GD1hMok0YfKTFOtUJMJFGLBa;455611;jbRgWtRe9q4=",
-            "https://sssc.uk.gov.in/recruitment-notification/",
-            "https://dsssb.delhi.gov.in/",
-            "https://gsssb.gujarat.gov.in/Notification",
-            "https://rssb.rajasthan.gov.in/advertisements",
-            "https://upsssc.gov.in/AllNotifications.aspx",
-            "https://bankofbaroda.bank.in/career/current-opportunities",
-            "https://www.southindianbank.bank.in/",
-            "https://sbi.bank.in/web/careers/current-openings",
-            "https://www.idbi.bank.in/idbi-bank-careers-current-openings.aspx",
-            "https://rajcrb.rajasthan.gov.in/RecruitmentAdvertisements.aspx?menu_id=13",
-            "https://www.nhb.org.in/oppurtunitiesnhb/",
-            "https://opportunities.rbi.org.in/Scripts/Vacancies.aspx",
-            "https://pnb.bank.in/Recruitments.aspx",
-            "https://bankofindia.bank.in/career/recruitment-notice",
-            "https://www.canarabank.bank.in/pages/career",
-            "https://www.nainitalbank.bank.in/en/Careers/careerslist",
-            "https://www.nabard.org/careers-notices1.aspx?cid=693&id=26",
-            "https://www.epfo.gov.in/recruitments/",
-            "https://licindia.in/en/web/guest/careers",
-            "https://esic.gov.in/recruitments",
-            "https://jkb.bank.in/career"
-        ]
-    }
-
-# ---------------------------------------------------------------------------
-# 3. SCRAPE TARGET URL FOR PDF LINKS
-# ---------------------------------------------------------------------------
-def find_pdf_links(target_url):
-    print(f"🔍 Scanning page for PDFs: {target_url}")
-    pdf_links = []
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    
-    try:
-        # verify=False prevents SSL Certificate Verification failures on government sites
-        response = requests.get(target_url, headers=headers, timeout=15, verify=False)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        for link in soup.find_all('a', href=True):
-            href = link['href']
-            if '.pdf' in href.lower():
-                if not href.startswith('http'):
-                    href = requests.compat.urljoin(target_url, href)
-                pdf_links.append(href)
-    except Exception as e:
-        print(f"❌ Scraper error on {target_url}: {e}")
-        
-    return list(set(pdf_links))
-
-# ---------------------------------------------------------------------------
-# 4. PROCESS PDF WITH GEMINI 2.5 FLASH
-# ---------------------------------------------------------------------------
-def parse_pdf_with_gemini(pdf_url):
-    print(f"📥 Downloading PDF for AI Analysis: {pdf_url}")
-    try:
-        pdf_response = requests.get(pdf_url, timeout=25, verify=False)
-        pdf_bytes = pdf_response.content
-
-        prompt = """
-        Analyze this official recruitment notification PDF.
-        Extract the following information and output strictly valid JSON matching this schema:
-        {
-          "job_title": "Full Official Job Title",
-          "notification_issue_date": "YYYY-MM-DD",
-          "total_vacancies": "Total positions or 'Not Specified'",
-          "eligibility_summary": "Brief eligibility requirements",
-          "last_date_to_apply": "YYYY-MM-DD or 'Not Specified'",
-          "formatted_post_content": "HTML formatted blog post including heading <h2>, overview, eligibility table, important dates table, and official link."
-        }
-        """
-
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=[
-                types.Part.from_bytes(
-                    data=pdf_bytes,
-                    mime_type='application/pdf',
-                ),
-                prompt
-            ],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
-            )
-        )
-        return json.loads(response.text)
-    except Exception as e:
-        print(f"❌ Gemini Parsing Error: {e}")
-        return None
-
-# ---------------------------------------------------------------------------
-# 5. POST DRAFT TO WORDPRESS REST API
-# ---------------------------------------------------------------------------
-def create_wordpress_draft(data, post_status):
-    endpoint = f"{WP_SITE_URL}/wp-json/wp/v2/posts"
-    
-    post_body = {
-        "title": data.get("job_title", "New Job Notification"),
-        "content": data.get("formatted_post_content", ""),
-        "status": post_status
-    }
-    
-    try:
-        response = requests.post(
-            endpoint,
-            auth=(WP_USERNAME, WP_APP_PASSWORD),
-            json=post_body,
-            timeout=15,
-            verify=False
-        )
-        if response.status_code in [200, 201]:
-            print(f"🎉 SUCCESS! Draft created in WordPress: {data.get('job_title')}")
+        r = requests.get(f"{WP_SITE_URL}/wp-json/sarkari-ai/v1/settings", timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, dict) and data.get("target_urls"):
+                log.info("Loaded settings from WordPress plugin.")
+                return data
+            log.warning("Plugin settings had no target_urls; using fallback list.")
         else:
-            print(f"❌ Failed to post to WP. Status: {response.status_code} - {response.text}")
+            log.warning(f"Settings endpoint returned HTTP {r.status_code}; using fallback.")
     except Exception as e:
-        print(f"❌ WordPress REST API Error: {e}")
+        log.warning(f"Could not fetch WP settings ({e}); using fallback.")
+    return FALLBACK_SETTINGS
+
 
 # ---------------------------------------------------------------------------
-# 6. MAIN EXECUTION CONTROLLER
+# 3. HTTP SESSION FOR GOVERNMENT PORTALS (legacy SSL friendly)
 # ---------------------------------------------------------------------------
-def main():
-    settings = get_wp_settings()
-    max_days = settings.get("max_age_days", 7)
-    post_status = settings.get("post_status", "draft")
-    target_urls = settings.get("target_urls", [])
+class LegacySSLAdapter(HTTPAdapter):
+    def init_poolmanager(self, *args, **kwargs):
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            ctx.set_ciphers("DEFAULT@SECLEVEL=1")
+        except ssl.SSLError:
+            pass
+        # Allow old servers without secure renegotiation (OpenSSL 3 blocks by default)
+        ctx.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
+        kwargs["ssl_context"] = ctx
+        return super().init_poolmanager(*args, **kwargs)
 
-    print(f"🚀 Engine started. Age limit: {max_days} days | Post status: {post_status}")
-    cutoff_date = datetime.now() - timedelta(days=max_days)
 
-    for url in target_urls:
-        pdf_list = find_pdf_links(url)
-        print(f"📄 Found {len(pdf_list)} PDF link(s) on {url}.")
-        
-        for pdf_url in pdf_list[:2]:  # Test with first 2 PDFs found
-            extracted_data = parse_pdf_with_gemini(pdf_url)
-            
-            if not extracted_data:
+def make_session():
+    s = requests.Session()
+    s.verify = False
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/pdf,*/*;q=0.8",
+    })
+    adapter = LegacySSLAdapter(max_retries=2)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
+SESSION = make_session()
+
+LINK_HINTS = (".pdf", "download", "viewdoc", "getfile", "attachment", "showfile", "openfile")
+
+
+def find_pdf_links(target_url):
+    """Return candidate document links in page order (newest usually first)."""
+    log.info(f"Scanning: {target_url}")
+    links = []
+    try:
+        r = SESSION.get(target_url, timeout=25)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if href.lower().startswith(("javascript:", "mailto:", "#", "tel:")):
                 continue
+            if any(h in href.lower() for h in LINK_HINTS):
+                links.append(urljoin(target_url, href))
+    except Exception as e:
+        log.error(f"Scraper error on {target_url}: {e}")
+        return []
+    links = list(dict.fromkeys(links))  # de-duplicate, keep order
+    if not links:
+        log.info("  No document links found (page may be JavaScript-rendered).")
+    return links
 
-            issue_date_str = extracted_data.get("notification_issue_date", "")
+
+def download_pdf(pdf_url):
+    r = SESSION.get(pdf_url, timeout=45)
+    r.raise_for_status()
+    content = r.content
+    if not content[:1024].lstrip().startswith(b"%PDF"):
+        raise ValueError("not a PDF file")
+    if len(content) > MAX_PDF_SIZE:
+        raise ValueError(f"PDF too large ({len(content)//1024//1024} MB)")
+    return content
+
+
+# ---------------------------------------------------------------------------
+# 4. SEEN-STORE (no duplicate processing, no duplicate Gemini billing)
+# ---------------------------------------------------------------------------
+def load_seen():
+    try:
+        with open(SEEN_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {k: "" for k in data}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_seen(seen):
+    tmp = SEEN_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(seen, f, indent=1, sort_keys=True)
+    os.replace(tmp, SEEN_FILE)
+
+
+def mark_seen(seen, *keys):
+    now = datetime.now().isoformat(timespec="seconds")
+    for k in keys:
+        if k:
+            seen[k] = now
+    save_seen(seen)
+
+
+def log_for_review(pdf_url, reason):
+    with open(REVIEW_LOG, "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now().isoformat(timespec='seconds')} | {reason} | {pdf_url}\n")
+
+
+# ---------------------------------------------------------------------------
+# 5. GEMINI (model fallback, smart retries, Files API for large PDFs)
+# ---------------------------------------------------------------------------
+_active_model_idx = 0
+_dead_models = set()
+
+
+def _err_text(e):
+    return f"{getattr(e, 'code', '')} {e}".lower()
+
+
+def _is_model_missing(e):
+    t = _err_text(e)
+    return ("404" in t or "not found" in t or "is not supported" in t
+            or "no longer available" in t or "deprecated" in t)
+
+
+def _is_fatal_key_error(e):
+    t = _err_text(e)
+    return ("api key not valid" in t or "api_key_invalid" in t
+            or "api key expired" in t or "permission_denied" in t and "key" in t)
+
+
+def _is_transient(e):
+    t = _err_text(e)
+    return any(c in t for c in ("429", "500", "502", "503", "504", "unavailable",
+                                "overloaded", "resource_exhausted", "deadline",
+                                "timed out", "timeout", "connection"))
+
+
+def call_gemini(contents, json_mode=True, max_retries=4):
+    global _active_model_idx
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json" if json_mode else "text/plain",
+        temperature=0.1,
+    )
+    last_err = None
+    while _active_model_idx < len(MODEL_CANDIDATES):
+        model = MODEL_CANDIDATES[_active_model_idx]
+        if model in _dead_models:
+            _active_model_idx += 1
+            continue
+        for attempt in range(1, max_retries + 1):
             try:
-                issue_date = datetime.strptime(issue_date_str, "%Y-%m-%d")
-                if issue_date < cutoff_date:
-                    print(f"⛔ Skipped old post dated {issue_date_str}. Cutoff date is {cutoff_date.strftime('%Y-%m-%d')}")
+                resp = client.models.generate_content(model=model, contents=contents, config=config)
+                if not resp.text:
+                    raise TransientError("Gemini returned an empty response")
+                return resp.text
+            except TransientError as e:
+                last_err = e
+                if attempt == max_retries:
+                    raise
+                time.sleep(5 * attempt)
+            except Exception as e:
+                last_err = e
+                if _is_fatal_key_error(e):
+                    raise FatalError(f"Gemini API key problem: {e}")
+                if _is_model_missing(e):
+                    log.warning(f"Model '{model}' unavailable ({str(e)[:120]}). Trying next model...")
+                    _dead_models.add(model)
+                    break
+                if _is_transient(e) and attempt < max_retries:
+                    wait = attempt * 10 + random.randint(1, 5)
+                    log.warning(f"Gemini transient error on {model}; retry in {wait}s "
+                                f"({attempt}/{max_retries}): {str(e)[:120]}")
+                    time.sleep(wait)
                     continue
-            except ValueError:
-                print(f"⚠️ Could not parse date ({issue_date_str}). Proceeding...")
+                if _is_transient(e):
+                    raise TransientError(str(e))
+                raise
+        else:
+            continue
+        _active_model_idx += 1
+    raise FatalError(f"No working Gemini model. Tried {MODEL_CANDIDATES}. Last error: {last_err}")
 
-            create_wordpress_draft(extracted_data, post_status)
+
+PROMPT_TEMPLATE = """
+You are an accuracy-first editor for an Indian government jobs website.
+Today's date is {today}.
+
+Analyze this PDF. First decide whether it is an official RECRUITMENT / VACANCY notification
+(an advertisement inviting applications for posts). Admit cards, results, syllabus, answer keys,
+tenders, circulars and corrigenda are NOT recruitment notifications.
+
+STRICT RULES:
+- Use ONLY facts written in the PDF. Never guess or invent numbers, dates, fees or posts.
+- If a detail is missing, write "Not Specified".
+- All dates in YYYY-MM-DD in the JSON fields.
+- Output strictly valid JSON, nothing else.
+
+JSON schema:
+{{
+  "is_recruitment_notification": true,
+  "job_title": "Full official title, e.g. 'UPSC Combined Medical Services 2026 - 705 Posts'",
+  "notification_issue_date": "YYYY-MM-DD or null",
+  "application_start_date": "YYYY-MM-DD or null",
+  "last_date_to_apply": "YYYY-MM-DD or null",
+  "total_vacancies": "Total positions or 'Not Specified'",
+  "eligibility_summary": "Brief eligibility requirements",
+  "short_description": "2 sentence plain-text summary (max 300 characters)",
+  "advt_number": "Advertisement/Notification number or 'N/A'",
+  "hiring_organization": "Official board/department name",
+  "job_location": "City/State or 'India'",
+  "salary_amount": 0,
+  "formatted_post_content": "HTML (see below)"
+}}
+
+salary_amount: lowest monthly pay as a plain integer (e.g. 35400); 0 if unspecified.
+
+formatted_post_content must be clean HTML fragment (no <html>, <body>, <script>, markdown or code fences, no links) containing:
+<h2> title, short overview paragraph, then <h2>/<h3> sections with <table> for:
+Important Dates (notification date, start date, last date, exam date if given),
+Vacancy Details (post-wise vacancies and category split if given),
+Eligibility (education, age limit with relaxation, experience),
+Application Fee, Pay Scale, Selection Process, and How to Apply (numbered steps).
+Omit a section only if the PDF has nothing about it.
+"""
+
+
+def extract_with_gemini(pdf_bytes):
+    uploaded = None
+    prompt = PROMPT_TEMPLATE.format(today=datetime.now().strftime("%Y-%m-%d"))
+    try:
+        if len(pdf_bytes) <= INLINE_PDF_LIMIT:
+            part = types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
+        else:
+            uploaded = client.files.upload(
+                file=io.BytesIO(pdf_bytes),
+                config=types.UploadFileConfig(mime_type="application/pdf"),
+            )
+            for _ in range(20):
+                state = str(getattr(uploaded, "state", "")).upper()
+                if "PROCESSING" not in state:
+                    break
+                time.sleep(3)
+                uploaded = client.files.get(name=uploaded.name)
+            part = uploaded
+
+        raw = call_gemini([part, prompt], json_mode=True)
+    finally:
+        if uploaded is not None:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass
+
+    raw = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+    data = json.loads(raw)
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    if not isinstance(data, dict):
+        raise ValueError("Gemini JSON was not an object")
+    return data
+
+
+# ---------------------------------------------------------------------------
+# 6. VALIDATION HELPERS
+# ---------------------------------------------------------------------------
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def parse_date(value):
+    if isinstance(value, str) and DATE_RE.match(value.strip()):
+        try:
+            return datetime.strptime(value.strip(), "%Y-%m-%d")
+        except ValueError:
+            return None
+    return None
+
+
+def norm(s):
+    return re.sub(r"[^a-z0-9]+", " ", str(s or "").lower()).strip()
+
+
+def clean_value(v, default=""):
+    if v is None:
+        return default
+    v = str(v).strip()
+    return v if v and v.lower() not in ("null", "none") else default
+
+
+def sanitize_html(html):
+    html = re.sub(r"^```(?:html)?|```$", "", (html or "").strip(), flags=re.MULTILINE)
+    html = re.sub(r"(?is)<script.*?</script>", "", html)
+    html = re.sub(r"(?is)<style.*?</style>", "", html)
+    html = re.sub(r"(?is)</?(?:!doctype|html|head|body)[^>]*>", "", html)
+    html = re.sub(r"(?i)\son\w+\s*=\s*(\"[^\"]*\"|'[^']*')", "", html)
+    return html.strip()
+
+
+# ---------------------------------------------------------------------------
+# 7. JSON-LD (Google JobPosting)
+# ---------------------------------------------------------------------------
+def build_job_schema(data, source_page):
+    issued = parse_date(data.get("notification_issue_date")) or datetime.now()
+    org = clean_value(data.get("hiring_organization"), "Government Recruitment Board")
+    location = clean_value(data.get("job_location"), "India")
+    parsed = urlparse(source_page)
+    org_site = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else WP_SITE_URL
+
+    schema = {
+        "@context": "https://schema.org/",
+        "@type": "JobPosting",
+        "title": clean_value(data.get("job_title"), "Government Job Vacancy"),
+        "description": clean_value(data.get("short_description")
+                                   or data.get("eligibility_summary"),
+                                   "Official government recruitment notification."),
+        "datePosted": issued.strftime("%Y-%m-%d"),
+        "employmentType": "FULL_TIME",
+        "directApply": False,
+        "hiringOrganization": {"@type": "Organization", "name": org, "sameAs": org_site},
+        "jobLocation": {
+            "@type": "Place",
+            "address": {
+                "@type": "PostalAddress",
+                "addressLocality": location,
+                "addressRegion": location,
+                "addressCountry": "IN",
+            },
+        },
+    }
+
+    last = parse_date(data.get("last_date_to_apply"))
+    if last:  # only add a closing date when the PDF really gives one
+        schema["validThrough"] = last.strftime("%Y-%m-%dT23:59:59")
+
+    advt = clean_value(data.get("advt_number"))
+    if advt and advt.upper() != "N/A":
+        schema["identifier"] = {"@type": "PropertyValue", "name": org, "value": advt}
+
+    try:
+        salary = float(data.get("salary_amount") or 0)
+    except (TypeError, ValueError):
+        salary = 0
+    if salary > 0:
+        schema["baseSalary"] = {
+            "@type": "MonetaryAmount",
+            "currency": "INR",
+            "value": {"@type": "QuantitativeValue", "value": salary, "unitText": "MONTH"},
+        }
+
+    return f'\n\n<script type="application/ld+json">\n{json.dumps(schema, indent=2, ensure_ascii=False)}\n</script>\n'
+
+
+# ---------------------------------------------------------------------------
+# 8. WORDPRESS
+# ---------------------------------------------------------------------------
+WP_AUTH = (WP_USERNAME, WP_APP_PASSWORD)
+
+
+def check_wp_auth():
+    try:
+        r = requests.get(f"{WP_SITE_URL}/wp-json/wp/v2/users/me", auth=WP_AUTH, timeout=20)
+    except Exception as e:
+        raise FatalError(f"Cannot reach WordPress: {e}")
+    if r.status_code == 200:
+        log.info(f"WordPress login OK as '{r.json().get('name', WP_USERNAME)}'.")
+        return
+    raise FatalError(
+        f"WordPress auth failed (HTTP {r.status_code}). Check WP_USERNAME / WP_APP_PASSWORD "
+        f"(Application Password, not login password) and that REST API / security plugins "
+        f"are not blocking it. Response: {r.text[:200]}")
+
+
+def wp_post_exists(title, advt):
+    """Skip if a post with same title or advertisement number is already on the site."""
+    queries = []
+    if advt and advt.upper() != "N/A":
+        queries.append(advt)
+    queries.append(title)
+    for q in queries:
+        try:
+            r = requests.get(f"{WP_SITE_URL}/wp-json/wp/v2/posts", auth=WP_AUTH, timeout=20,
+                             params={"search": q, "status": "any", "per_page": 10,
+                                     "_fields": "id,title,content"})
+            if r.status_code != 200:
+                continue
+            for p in r.json():
+                existing_title = norm(p.get("title", {}).get("rendered"))
+                body = norm(p.get("content", {}).get("rendered"))
+                if existing_title == norm(title):
+                    return True
+                if advt and advt.upper() != "N/A" and len(norm(advt)) >= 4 and norm(advt) in body:
+                    return True
+        except Exception as e:
+            log.warning(f"Duplicate check failed ({e}); continuing.")
+    return False
+
+
+def create_wordpress_post(data, pdf_url, source_page, post_status):
+    title = clean_value(data.get("job_title"), "New Job Notification")
+    body = sanitize_html(data.get("formatted_post_content"))
+
+    links = (
+        "<h3>Important Links</h3>"
+        "<table><tbody>"
+        f'<tr><td><strong>Official Notification PDF</strong></td>'
+        f'<td><a href="{pdf_url}" target="_blank" rel="nofollow noopener">Download Notification</a></td></tr>'
+        f'<tr><td><strong>Official Website / Source Page</strong></td>'
+        f'<td><a href="{source_page}" target="_blank" rel="nofollow noopener">Visit Official Page</a></td></tr>'
+        "</tbody></table>"
+        "<p><em>Disclaimer: Details are compiled from the official notification. "
+        "Candidates must verify everything on the official website before applying.</em></p>"
+    )
+
+    payload = {
+        "title": title,
+        "content": body + links + build_job_schema(data, source_page),
+        "excerpt": clean_value(data.get("short_description")),
+        "status": post_status,
+    }
+    r = requests.post(f"{WP_SITE_URL}/wp-json/wp/v2/posts", auth=WP_AUTH, json=payload, timeout=30)
+    if r.status_code in (200, 201):
+        log.info(f"CREATED ({post_status}): {title}  ->  {r.json().get('link', '')}")
+        return True
+    if r.status_code in (401, 403):
+        raise FatalError(f"WordPress refused the post (HTTP {r.status_code}): {r.text[:200]}")
+    log.error(f"WP post failed. HTTP {r.status_code}: {r.text[:300]}")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# 9. MAIN
+# ---------------------------------------------------------------------------
+def process_pdf(pdf_url, source_page, cutoff, post_status, seen, stats):
+    url_key = f"url:{pdf_url}"
+    if url_key in seen:
+        return
+    log.info(f"Checking: {pdf_url}")
+
+    try:
+        pdf_bytes = download_pdf(pdf_url)
+    except ValueError as e:                       # permanent: not a PDF / too big
+        log.info(f"  Skipped ({e}).")
+        mark_seen(seen, url_key)
+        return
+    except Exception as e:                        # network problem: retry next run
+        log.warning(f"  Download failed: {e}")
+        stats["errors"] += 1
+        return
+
+    sha_key = "sha:" + hashlib.sha256(pdf_bytes).hexdigest()
+    if sha_key in seen:
+        log.info("  Same PDF already processed under another URL.")
+        mark_seen(seen, url_key)
+        return
+
+    try:
+        data = extract_with_gemini(pdf_bytes)
+    except FatalError:
+        raise
+    except TransientError as e:
+        log.warning(f"  Gemini temporarily failing; will retry next run: {e}")
+        stats["errors"] += 1
+        return
+    except Exception as e:
+        log.error(f"  Gemini parsing error: {e}")
+        stats["errors"] += 1
+        log_for_review(pdf_url, f"Gemini/JSON error: {str(e)[:120]}")
+        return
+
+    if not data.get("is_recruitment_notification", True):
+        log.info("  Not a recruitment notification; skipped.")
+        mark_seen(seen, url_key, sha_key)
+        stats["skipped"] += 1
+        return
+
+    title = clean_value(data.get("job_title"))
+    if not title or not sanitize_html(data.get("formatted_post_content")):
+        log.warning("  Incomplete AI output; logged for manual review.")
+        log_for_review(pdf_url, "incomplete AI output")
+        stats["errors"] += 1
+        return
+
+    issued = parse_date(data.get("notification_issue_date"))
+    if not issued:
+        log.warning("  No valid issue date; logged for manual review.")
+        log_for_review(pdf_url, f"no issue date: {title}")
+        mark_seen(seen, url_key, sha_key)
+        stats["skipped"] += 1
+        return
+    if issued < cutoff:
+        log.info(f"  Old notice ({issued:%Y-%m-%d}); skipped.")
+        mark_seen(seen, url_key, sha_key)
+        stats["skipped"] += 1
+        return
+
+    last = parse_date(data.get("last_date_to_apply"))
+    if last and last.date() < datetime.now().date():
+        log.info(f"  Already expired ({last:%Y-%m-%d}); skipped.")
+        mark_seen(seen, url_key, sha_key)
+        stats["skipped"] += 1
+        return
+
+    if wp_post_exists(title, clean_value(data.get("advt_number"))):
+        log.info("  Already on the website; skipped.")
+        mark_seen(seen, url_key, sha_key)
+        stats["skipped"] += 1
+        return
+
+    if create_wordpress_post(data, pdf_url, source_page, post_status):
+        mark_seen(seen, url_key, sha_key)
+        stats["created"] += 1
+    else:
+        stats["errors"] += 1
+    time.sleep(random.uniform(2, 4))
+
+
+def main():
+    if "PASTE_" in WP_APP_PASSWORD or "PASTE_" in GEMINI_API_KEY:
+        sys.exit("Set WP_APP_PASSWORD and GEMINI_API_KEY (env vars or at the top of the script).")
+
+    settings = get_wp_settings()
+    max_days = int(settings.get("max_age_days", DEFAULT_MAX_AGE_DAYS) or DEFAULT_MAX_AGE_DAYS)
+    post_status = settings.get("post_status", "draft")
+    if post_status not in ("draft", "pending", "publish", "private"):
+        post_status = "draft"
+    target_urls = settings.get("target_urls") or FALLBACK_SETTINGS["target_urls"]
+    cutoff = datetime.now() - timedelta(days=max_days)
+
+    log.info(f"Engine started | age limit: {max_days} days | status: {post_status} | "
+             f"{len(target_urls)} portals")
+
+    stats = {"created": 0, "skipped": 0, "errors": 0}
+    seen = load_seen()
+
+    try:
+        check_wp_auth()
+        # Quick Gemini preflight: finds a working model or fails loudly right away
+        call_gemini(["Reply with the single word OK."], json_mode=False, max_retries=2)
+        log.info(f"Gemini OK using model: {MODEL_CANDIDATES[_active_model_idx]}")
+
+        for url in target_urls:
+            candidates = [p for p in find_pdf_links(url) if f"url:{p}" not in seen]
+            log.info(f"  {len(candidates)} new document link(s) on this page.")
+            for pdf_url in candidates[:MAX_PDFS_PER_PAGE]:
+                process_pdf(pdf_url, url, cutoff, post_status, seen, stats)
+    except FatalError as e:
+        log.critical(f"STOPPED: {e}")
+    except KeyboardInterrupt:
+        log.info("Interrupted by user.")
+    finally:
+        save_seen(seen)
+        log.info(f"Done | created: {stats['created']} | skipped: {stats['skipped']} | "
+                 f"errors: {stats['errors']}")
+
 
 if __name__ == "__main__":
     main()
