@@ -566,11 +566,20 @@ def create_wordpress_post(data, pdf_url, source_page, post_status):
         "Candidates must verify everything on the official website before applying.</em></p>"
     )
 
+        last = parse_date(data.get("last_date_to_apply"))
+    vac = clean_value(data.get("total_vacancies"))
+    if vac.lower().startswith("not specified"):
+        vac = ""
+
     payload = {
         "title": title,
         "content": body + links + build_job_schema(data, source_page),
         "excerpt": clean_value(data.get("short_description")),
         "status": post_status,
+        "meta": {
+            "sjg_last_date": last.strftime("%Y-%m-%d") if last else "",
+            "sjg_vacancies": vac,
+        },
     }
     r = requests.post(f"{WP_SITE_URL}/wp-json/wp/v2/posts", auth=WP_AUTH, json=payload, timeout=30)
     if r.status_code in (200, 201):
