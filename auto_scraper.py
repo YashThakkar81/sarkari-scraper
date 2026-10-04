@@ -1,3 +1,4 @@
+
 import os
 import re
 import json
@@ -100,40 +101,18 @@ def get_wp_settings():
 # ---------------------------------------------------------------------------
 # 3. SCRAPE TARGET URL FOR PDF LINKS
 # ---------------------------------------------------------------------------
-import ssl
-import urllib3
-
-# Suppress insecure request warnings caused by disabling SSL verification
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-class LegacySSLAdapter(requests.adapters.HTTPAdapter):
-    def init_poolmanager(self, *args, **kwargs):
-        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        # Supports legacy ciphers used by government servers
-        ctx.set_ciphers('DEFAULT@SECLEVEL=1')
-        kwargs['ssl_context'] = ctx
-        return super().init_poolmanager(*args, **kwargs)
-
 def find_pdf_links(target_url):
     print(f"🔍 Scanning page for PDFs: {target_url}")
     pdf_links = []
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-
+    
     try:
-        session = requests.Session()
-        session.verify = False
-        session.headers.update(headers)
-        adapter = LegacySSLAdapter()
-        session.mount('https://', adapter)
-        session.mount('http://', adapter)
-
-        response = session.get(target_url, timeout=20, verify=False)
+        # verify=False prevents SSL Certificate Verification failures on government sites
+        response = requests.get(target_url, headers=headers, timeout=15, verify=False)
         soup = BeautifulSoup(response.text, 'html.parser')
-
+        
         for link in soup.find_all('a', href=True):
             href = link['href']
             if '.pdf' in href.lower():
@@ -142,16 +121,13 @@ def find_pdf_links(target_url):
                 pdf_links.append(href)
     except Exception as e:
         print(f"❌ Scraper error on {target_url}: {e}")
-
+        
     return list(set(pdf_links))
 
 # ---------------------------------------------------------------------------
-# 4. PROCESS PDF WITH GEMINI 3.8 FLASH
+# 4. PROCESS PDF WITH GEMINI 2.5 FLASH
 # ---------------------------------------------------------------------------
-import time
-import random
-
-def parse_pdf_with_gemini(pdf_url, max_retries=4):
+def parse_pdf_with_gemini(pdf_url):
     print(f"📥 Downloading PDF for AI Analysis: {pdf_url}")
     try:
         pdf_response = requests.get(pdf_url, timeout=25, verify=False)
@@ -170,30 +146,20 @@ def parse_pdf_with_gemini(pdf_url, max_retries=4):
         }
         """
 
-        for attempt in range(1, max_retries + 1):
-            try:
-                response = client.models.generate_content(
-                    model='gemini-3.8-flash',
-                    contents=[
-                        types.Part.from_bytes(
-                            data=pdf_bytes,
-                            mime_type='application/pdf',
-                        ),
-                        prompt
-                    ],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json"
-                    )
-                )
-                return json.loads(response.text)
-            except Exception as e:
-                if "503" in str(e) and attempt < max_retries:
-                    wait_time = (attempt * 10) + random.randint(1, 5)
-                    print(f"⚠️ 503 High Demand Error. Retrying in {wait_time}s (Attempt {attempt}/{max_retries})...")
-                    time.sleep(wait_time)
-                else:
-                    raise e
-
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[
+                types.Part.from_bytes(
+                    data=pdf_bytes,
+                    mime_type='application/pdf',
+                ),
+                prompt
+            ],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
+            )
+        )
+        return json.loads(response.text)
     except Exception as e:
         print(f"❌ Gemini Parsing Error: {e}")
         return None
