@@ -564,9 +564,9 @@ def create_wordpress_post(data, pdf_url, source_page, post_status):
         "</tbody></table>"
         "<p><em>Disclaimer: Details are compiled from the official notification. "
         "Candidates must verify everything on the official website before applying.</em></p>"
-    )
+        )
 
-        last = parse_date(data.get("last_date_to_apply"))
+    last = parse_date(data.get("last_date_to_apply"))
     vac = clean_value(data.get("total_vacancies"))
     if vac.lower().startswith("not specified"):
         vac = ""
