@@ -483,25 +483,28 @@ def build_job_schema(data, source_page):
         },
     }
 
-    last = parse_date(data.get("last_date_to_apply"))
-    if last:  # only add a closing date when the PDF really gives one
-        schema["validThrough"] = last.strftime("%Y-%m-%dT23:59:59")
+        last = parse_date(data.get("last_date_to_apply"))
+    start = parse_date(data.get("application_start_date"))
+    vac = clean_value(data.get("total_vacancies"))
+    if vac.lower().startswith("not specified"):
+        vac = ""
+    age = clean_value(data.get("age_limit"))
+    if age.lower().startswith("not specified"):
+        age = ""
 
-    advt = clean_value(data.get("advt_number"))
-    if advt and advt.upper() != "N/A":
-        schema["identifier"] = {"@type": "PropertyValue", "name": org, "value": advt}
-
-    try:
-        salary = float(data.get("salary_amount") or 0)
-    except (TypeError, ValueError):
-        salary = 0
-    if salary > 0:
-        schema["baseSalary"] = {
-            "@type": "MonetaryAmount",
-            "currency": "INR",
-            "value": {"@type": "QuantitativeValue", "value": salary, "unitText": "MONTH"},
-        }
-
+    payload = {
+        "title": title,
+        "content": body + links + build_job_schema(data, source_page),
+        "excerpt": clean_value(data.get("short_description")),
+        "status": post_status,
+        "meta": {
+            "sjg_last_date": last.strftime("%Y-%m-%d") if last else "",
+            "sjg_start_date": start.strftime("%Y-%m-%d") if start else "",
+            "sjg_vacancies": vac,
+            "sjg_age": age,
+            "sjg_org": clean_value(data.get("hiring_organization")),
+        },
+    }
     return f'\n\n<script type="application/ld+json">\n{json.dumps(schema, indent=2, ensure_ascii=False)}\n</script>\n'
 
 
