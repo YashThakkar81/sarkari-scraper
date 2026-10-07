@@ -362,6 +362,7 @@ JSON schema:
   "eligibility_summary": "Brief eligibility requirements",
   "short_description": "2 sentence plain-text summary (max 300 characters)",
   "advt_number": "Advertisement/Notification number or 'N/A'",
+  "age_limit": "e.g. '21 to 35 years' or 'Not Specified'",
   "hiring_organization": "Official board/department name",
   "job_location": "City/State or 'India'",
   "salary_amount": 0,
