@@ -8,11 +8,11 @@ creates a WordPress post (draft by default) with JobPosting JSON-LD.
 Setup:
     pip install requests beautifulsoup4 google-genai urllib3
 
-Set credentials as environment variables (recommended):
+Required environment variables (GitHub: Settings > Secrets and variables > Actions):
     WP_USERNAME, WP_APP_PASSWORD, GEMINI_API_KEY
 Optional:
-    GEMINI_MODEL   -> force a specific model, e.g. gemini-3.6-flash
-    MAX_PDFS_PER_PAGE (default 5)
+    GEMINI_MODEL       -> force a specific model, e.g. gemini-3.6-flash
+    MAX_PDFS_PER_PAGE  (default 5)
 """
 
 import io
@@ -41,9 +41,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # 1. CONFIGURATION
 # ---------------------------------------------------------------------------
 WP_SITE_URL = "https://sarkarijobsguide.in"
-WP_USERNAME = os.environ.get("WP_USERNAME", "yashthakkar81@gmail.com")
-WP_APP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "x3Gi 5gKg WuHp YnWI K56d xiXy")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6LyR03t9eBaZX6cQMuX-yxLOv3bfSN8KJ_qPKyIKUcb_A")
+WP_USERNAME = os.environ.get("yashthakkar81@gmail.com", "").strip()
+WP_APP_PASSWORD = os.environ.get("x3Gi 5gKg WuHp YnWI K56d xiXy", "").strip()
+GEMINI_API_KEY = os.environ.get("AQ.Ab8RN6LyR03t9eBaZX6cQMuX-yxLOv3bfSN8KJ_qPKyIKUcb_A", "").strip()
 
 SEEN_FILE = "seen_notifications.json"
 REVIEW_LOG = "needs_review.log"
@@ -52,8 +52,7 @@ INLINE_PDF_LIMIT = 18 * 1024 * 1024      # above this, use the Gemini Files API
 MAX_PDF_SIZE = 45 * 1024 * 1024          # skip anything bigger
 DEFAULT_MAX_AGE_DAYS = 7
 
-# Models are tried in this order. gemini-3.8-flash (used earlier) does not exist,
-# which made every call fail. Check https://ai.google.dev/gemini-api/docs/models
+# Models are tried in this order. Check https://ai.google.dev/gemini-api/docs/models
 MODEL_CANDIDATES = [m for m in [
     os.environ.get("GEMINI_MODEL"),
     "gemini-3.6-flash",
@@ -66,7 +65,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
                     datefmt="%H:%M:%S")
 log = logging.getLogger("sarkari-bot")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+# Client is created in main() after credentials are validated
+client = None
 
 
 class FatalError(Exception):
@@ -281,7 +281,8 @@ def _is_model_missing(e):
 def _is_fatal_key_error(e):
     t = _err_text(e)
     return ("api key not valid" in t or "api_key_invalid" in t
-            or "api key expired" in t or "permission_denied" in t and "key" in t)
+            or "api key expired" in t
+            or ("permission_denied" in t and "key" in t))
 
 
 def _is_transient(e):
@@ -298,11 +299,14 @@ def call_gemini(contents, json_mode=True, max_retries=4):
         temperature=0.1,
     )
     last_err = None
+
     while _active_model_idx < len(MODEL_CANDIDATES):
         model = MODEL_CANDIDATES[_active_model_idx]
         if model in _dead_models:
             _active_model_idx += 1
             continue
+
+        model_unavailable = False
         for attempt in range(1, max_retries + 1):
             try:
                 resp = client.models.generate_content(model=model, contents=contents, config=config)
@@ -321,19 +325,22 @@ def call_gemini(contents, json_mode=True, max_retries=4):
                 if _is_model_missing(e):
                     log.warning(f"Model '{model}' unavailable ({str(e)[:120]}). Trying next model...")
                     _dead_models.add(model)
+                    model_unavailable = True
                     break
-                if _is_transient(e) and attempt < max_retries:
-                    wait = attempt * 10 + random.randint(1, 5)
-                    log.warning(f"Gemini transient error on {model}; retry in {wait}s "
-                                f"({attempt}/{max_retries}): {str(e)[:120]}")
-                    time.sleep(wait)
-                    continue
                 if _is_transient(e):
+                    if attempt < max_retries:
+                        wait = attempt * 10 + random.randint(1, 5)
+                        log.warning(f"Gemini transient error on {model}; retry in {wait}s "
+                                    f"({attempt}/{max_retries}): {str(e)[:120]}")
+                        time.sleep(wait)
+                        continue
                     raise TransientError(str(e))
                 raise
-        else:
+
+        if model_unavailable:
+            _active_model_idx += 1
             continue
-        _active_model_idx += 1
+
     raise FatalError(f"No working Gemini model. Tried {MODEL_CANDIDATES}. Last error: {last_err}")
 
 
@@ -452,11 +459,19 @@ def sanitize_html(html):
     return html.strip()
 
 
+def to_int(v):
+    try:
+        return int(float(str(v).replace(",", "").strip()))
+    except (ValueError, TypeError):
+        return 0
+
+
 # ---------------------------------------------------------------------------
 # 7. JSON-LD (Google JobPosting)
 # ---------------------------------------------------------------------------
 def build_job_schema(data, source_page):
     issued = parse_date(data.get("notification_issue_date")) or datetime.now()
+    last = parse_date(data.get("last_date_to_apply"))
     org = clean_value(data.get("hiring_organization"), "Government Recruitment Board")
     location = clean_value(data.get("job_location"), "India")
     parsed = urlparse(source_page)
@@ -484,8 +499,19 @@ def build_job_schema(data, source_page):
         },
     }
 
-        
-    return f'\n\n<script type="application/ld+json">\n{json.dumps(schema, indent=2, ensure_ascii=False)}\n</script>\n'
+    if last:
+        schema["validThrough"] = last.strftime("%Y-%m-%dT23:59:59+05:30")
+
+    salary = to_int(data.get("salary_amount"))
+    if salary > 0:
+        schema["baseSalary"] = {
+            "@type": "MonetaryAmount",
+            "currency": "INR",
+            "value": {"@type": "QuantitativeValue", "value": salary, "unitText": "MONTH"},
+        }
+
+    return ('\n\n<script type="application/ld+json">\n'
+            f'{json.dumps(schema, indent=2, ensure_ascii=False)}\n</script>\n')
 
 
 # ---------------------------------------------------------------------------
@@ -547,9 +573,9 @@ def create_wordpress_post(data, pdf_url, source_page, post_status):
         "</tbody></table>"
         "<p><em>Disclaimer: Details are compiled from the official notification. "
         "Candidates must verify everything on the official website before applying.</em></p>"
-        )
+    )
 
-        last = parse_date(data.get("last_date_to_apply"))
+    last = parse_date(data.get("last_date_to_apply"))
     start = parse_date(data.get("application_start_date"))
     vac = clean_value(data.get("total_vacancies"))
     if vac.lower().startswith("not specified"):
@@ -669,8 +695,15 @@ def process_pdf(pdf_url, source_page, cutoff, post_status, seen, stats):
 
 
 def main():
-    if "PASTE_" in WP_APP_PASSWORD or "PASTE_" in GEMINI_API_KEY:
-        sys.exit("Set WP_APP_PASSWORD and GEMINI_API_KEY (env vars or at the top of the script).")
+    global client
+
+    missing = [n for n, v in (("WP_USERNAME", WP_USERNAME),
+                              ("WP_APP_PASSWORD", WP_APP_PASSWORD),
+                              ("GEMINI_API_KEY", GEMINI_API_KEY)) if not v]
+    if missing:
+        sys.exit(f"Missing environment variables / GitHub secrets: {', '.join(missing)}")
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
     settings = get_wp_settings()
     max_days = int(settings.get("max_age_days", DEFAULT_MAX_AGE_DAYS) or DEFAULT_MAX_AGE_DAYS)
@@ -685,6 +718,7 @@ def main():
 
     stats = {"created": 0, "skipped": 0, "errors": 0}
     seen = load_seen()
+    fatal = False
 
     try:
         check_wp_auth()
@@ -699,12 +733,16 @@ def main():
                 process_pdf(pdf_url, url, cutoff, post_status, seen, stats)
     except FatalError as e:
         log.critical(f"STOPPED: {e}")
+        fatal = True
     except KeyboardInterrupt:
         log.info("Interrupted by user.")
     finally:
         save_seen(seen)
         log.info(f"Done | created: {stats['created']} | skipped: {stats['skipped']} | "
                  f"errors: {stats['errors']}")
+
+    if fatal:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
