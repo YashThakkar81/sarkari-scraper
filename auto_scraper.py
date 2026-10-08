@@ -484,28 +484,7 @@ def build_job_schema(data, source_page):
         },
     }
 
-        last = parse_date(data.get("last_date_to_apply"))
-    start = parse_date(data.get("application_start_date"))
-    vac = clean_value(data.get("total_vacancies"))
-    if vac.lower().startswith("not specified"):
-        vac = ""
-    age = clean_value(data.get("age_limit"))
-    if age.lower().startswith("not specified"):
-        age = ""
-
-    payload = {
-        "title": title,
-        "content": body + links + build_job_schema(data, source_page),
-        "excerpt": clean_value(data.get("short_description")),
-        "status": post_status,
-        "meta": {
-            "sjg_last_date": last.strftime("%Y-%m-%d") if last else "",
-            "sjg_start_date": start.strftime("%Y-%m-%d") if start else "",
-            "sjg_vacancies": vac,
-            "sjg_age": age,
-            "sjg_org": clean_value(data.get("hiring_organization")),
-        },
-    }
+        
     return f'\n\n<script type="application/ld+json">\n{json.dumps(schema, indent=2, ensure_ascii=False)}\n</script>\n'
 
 
@@ -570,10 +549,14 @@ def create_wordpress_post(data, pdf_url, source_page, post_status):
         "Candidates must verify everything on the official website before applying.</em></p>"
         )
 
-    last = parse_date(data.get("last_date_to_apply"))
+        last = parse_date(data.get("last_date_to_apply"))
+    start = parse_date(data.get("application_start_date"))
     vac = clean_value(data.get("total_vacancies"))
     if vac.lower().startswith("not specified"):
         vac = ""
+    age = clean_value(data.get("age_limit"))
+    if age.lower().startswith("not specified"):
+        age = ""
 
     payload = {
         "title": title,
@@ -582,7 +565,10 @@ def create_wordpress_post(data, pdf_url, source_page, post_status):
         "status": post_status,
         "meta": {
             "sjg_last_date": last.strftime("%Y-%m-%d") if last else "",
+            "sjg_start_date": start.strftime("%Y-%m-%d") if start else "",
             "sjg_vacancies": vac,
+            "sjg_age": age,
+            "sjg_org": clean_value(data.get("hiring_organization")),
         },
     }
     r = requests.post(f"{WP_SITE_URL}/wp-json/wp/v2/posts", auth=WP_AUTH, json=payload, timeout=30)
