@@ -42,8 +42,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ---------------------------------------------------------------------------
 WP_SITE_URL = "https://sarkarijobsguide.in"
 WP_USERNAME = os.environ.get("yashthakkar81@gmail.com", "").strip()
-WP_APP_PASSWORD = (os.environ.get("x3Gi 5gKg WuHp YnWI K56d xiXy")
-                   or os.environ.get("x3Gi 5gKg WuHp YnWI K56d xiXy") or "").strip()
+WP_APPLICATION_PASSWORD = os.environ.get("x3Gi 5gKg WuHp YnWI K56d xiXy", "").strip()
 GEMINI_API_KEY = os.environ.get("AQ.Ab8RN6LyR03t9eBaZX6cQMuX-yxLOv3bfSN8KJ_qPKyIKUcb_A", "").strip()
 
 SEEN_FILE = "seen_notifications.json"
