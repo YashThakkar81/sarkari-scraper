@@ -8,11 +8,12 @@ creates a WordPress post (draft by default) with JobPosting JSON-LD.
 Setup:
     pip install requests beautifulsoup4 google-genai urllib3
 
-Set credentials as environment variables (recommended):
-    WP_USERNAME, WP_APP_PASSWORD, GEMINI_API_KEY
+Credentials come from environment variables (GitHub Secrets in Actions):
+    WP_URL, WP_USERNAME, WP_APPLICATION_PASSWORD, GEMINI_API_KEY
 Optional:
-    GEMINI_MODEL   -> force a specific model, e.g. gemini-3.6-flash
-    MAX_PDFS_PER_PAGE (default 5)
+    GEMINI_MODEL        -> force a specific model, e.g. gemini-3.6-flash
+    MAX_PDFS_PER_PAGE   (default 5)
+    MAX_GEMINI_PER_RUN  (default 3) -> max PDFs sent to Gemini in one run
 """
 
 import io
@@ -52,12 +53,14 @@ if not (WP_USERNAME and WP_APP_PASSWORD and GEMINI_API_KEY):
 SEEN_FILE = "seen_notifications.json"
 REVIEW_LOG = "needs_review.log"
 MAX_PDFS_PER_PAGE = int(os.environ.get("MAX_PDFS_PER_PAGE", "5"))
+MAX_GEMINI_PER_RUN = int(os.environ.get("MAX_GEMINI_PER_RUN", "3"))
 INLINE_PDF_LIMIT = 18 * 1024 * 1024      # above this, use the Gemini Files API
 MAX_PDF_SIZE = 45 * 1024 * 1024          # skip anything bigger
 DEFAULT_MAX_AGE_DAYS = 7
 
-# Models are tried in this order. gemini-3.8-flash (used earlier) does not exist,
-# which made every call fail. Check https://ai.google.dev/gemini-api/docs/models
+# Models are tried in this order. If one is out of quota or overloaded,
+# the script moves to the next one automatically.
+# Check https://ai.google.dev/gemini-api/docs/models
 MODEL_CANDIDATES = [m for m in [
     os.environ.get("GEMINI_MODEL"),
     "gemini-3.6-flash",
@@ -74,11 +77,15 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 class FatalError(Exception):
-    """Problem that makes continuing pointless (bad key, bad WP login...)."""
+    """Problem that makes continuing pointless (bad key, bad WP login, no model left...)."""
 
 
 class TransientError(Exception):
     """Temporary problem; the item is NOT marked as seen so it retries next run."""
+
+
+class RunLimit(Exception):
+    """Per-run Gemini request cap reached. Not an error; the run ends normally."""
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +241,7 @@ def download_pdf(pdf_url):
 
 
 # ---------------------------------------------------------------------------
-# 4. SEEN-STORE (no duplicate processing, no duplicate Gemini billing)
+# 4. SEEN-STORE (no duplicate processing, no duplicate Gemini usage)
 # ---------------------------------------------------------------------------
 def load_seen():
     try:
@@ -266,10 +273,9 @@ def log_for_review(pdf_url, reason):
 
 
 # ---------------------------------------------------------------------------
-# 5. GEMINI (model fallback, smart retries, Files API for large PDFs)
+# 5. GEMINI (model fallback, quota/overload handling, Files API for large PDFs)
 # ---------------------------------------------------------------------------
-_active_model_idx = 0
-_dead_models = set()
+_dead_models = set()   # models given up on for the rest of this run
 
 
 def _err_text(e):
@@ -285,31 +291,33 @@ def _is_model_missing(e):
 def _is_fatal_key_error(e):
     t = _err_text(e)
     return ("api key not valid" in t or "api_key_invalid" in t
-            or "api key expired" in t or "permission_denied" in t and "key" in t)
+            or "api key expired" in t or ("permission_denied" in t and "key" in t))
 
 
 def _is_transient(e):
+    if isinstance(e, TransientError):
+        return True
     t = _err_text(e)
     return any(c in t for c in ("429", "500", "502", "503", "504", "unavailable",
                                 "overloaded", "resource_exhausted", "deadline",
                                 "timed out", "timeout", "connection"))
+
 
 def _is_daily_quota(e):
     t = _err_text(e)
     return "perday" in t or "per day" in t
 
 
-def call_gemini(contents, json_mode=True, max_retries=4):
-    global _active_model_idx
+def call_gemini(contents, json_mode=True, max_retries=3):
+    """Try each model in turn. A model is skipped for the rest of the run when it is
+    missing, out of daily quota, or still overloaded after several retries."""
     config = types.GenerateContentConfig(
         response_mime_type="application/json" if json_mode else "text/plain",
         temperature=0.1,
     )
     last_err = None
-    while _active_model_idx < len(MODEL_CANDIDATES):
-        model = MODEL_CANDIDATES[_active_model_idx]
+    for model in MODEL_CANDIDATES:
         if model in _dead_models:
-            _active_model_idx += 1
             continue
         for attempt in range(1, max_retries + 1):
             try:
@@ -317,11 +325,6 @@ def call_gemini(contents, json_mode=True, max_retries=4):
                 if not resp.text:
                     raise TransientError("Gemini returned an empty response")
                 return resp.text
-            except TransientError as e:
-                last_err = e
-                if attempt == max_retries:
-                    raise
-                time.sleep(5 * attempt)
             except Exception as e:
                 last_err = e
                 if _is_fatal_key_error(e):
@@ -334,19 +337,19 @@ def call_gemini(contents, json_mode=True, max_retries=4):
                     log.warning(f"Daily quota exhausted for '{model}'. Trying next model...")
                     _dead_models.add(model)
                     break
-                if _is_transient(e) and attempt < max_retries:
-                    wait = attempt * 10 + random.randint(1, 5)
-                    log.warning(f"Gemini transient error on {model}; retry in {wait}s "
-                                f"({attempt}/{max_retries}): {str(e)[:120]}")
-                    time.sleep(wait)
-                    continue
                 if _is_transient(e):
-                    raise TransientError(str(e))
-                raise
-        else:
-            continue
-        _active_model_idx += 1
-    raise FatalError(f"No working Gemini model. Tried {MODEL_CANDIDATES}. Last error: {last_err}")
+                    if attempt < max_retries:
+                        wait = attempt * 8 + random.randint(1, 5)
+                        log.warning(f"Gemini busy on {model}; retry in {wait}s "
+                                    f"({attempt}/{max_retries}): {str(e)[:100]}")
+                        time.sleep(wait)
+                        continue
+                    log.warning(f"'{model}' still busy after {max_retries} tries. Trying next model...")
+                    _dead_models.add(model)
+                    break
+                raise   # real error (bad request etc.): let the caller log it
+    raise FatalError(f"No Gemini model available right now (quota or overload). "
+                     f"Tried {MODEL_CANDIDATES}. Last error: {str(last_err)[:200]}")
 
 
 PROMPT_TEMPLATE = """
@@ -529,12 +532,12 @@ def check_wp_auth():
     except Exception as e:
         raise FatalError(f"Cannot reach WordPress: {e}")
     if r.status_code == 200:
-        log.info(f"WordPress login OK as '{r.json().get('name', WP_USERNAME)}'.")
+        log.info("WordPress login OK.")
         return
     raise FatalError(
-        f"WordPress auth failed (HTTP {r.status_code}). Check WP_USERNAME / WP_APP_PASSWORD "
-        f"(Application Password, not login password) and that REST API / security plugins "
-        f"are not blocking it. Response: {r.text[:200]}")
+        f"WordPress auth failed (HTTP {r.status_code}). Check WP_USERNAME / "
+        f"WP_APPLICATION_PASSWORD (Application Password, not login password) and that "
+        f"REST API / security plugins are not blocking it. Response: {r.text[:200]}")
 
 
 def wp_post_exists(title, advt):
@@ -620,6 +623,12 @@ def process_pdf(pdf_url, source_page, cutoff, post_status, seen, stats):
         mark_seen(seen, url_key)
         return
 
+    # Per-run cap on Gemini requests (protects the free daily quota)
+    if stats["gemini"] >= MAX_GEMINI_PER_RUN:
+        raise RunLimit(f"Reached {MAX_GEMINI_PER_RUN} Gemini requests this run; "
+                       f"remaining PDFs will be picked up in the next run.")
+    stats["gemini"] += 1
+
     try:
         data = extract_with_gemini(pdf_bytes)
     except FatalError:
@@ -682,9 +691,6 @@ def process_pdf(pdf_url, source_page, cutoff, post_status, seen, stats):
 
 
 def main():
-    if "PASTE_" in WP_APP_PASSWORD or "PASTE_" in GEMINI_API_KEY:
-        sys.exit("Set WP_APP_PASSWORD and GEMINI_API_KEY (env vars or at the top of the script).")
-
     settings = get_wp_settings()
     max_days = int(settings.get("max_age_days", DEFAULT_MAX_AGE_DAYS) or DEFAULT_MAX_AGE_DAYS)
     post_status = settings.get("post_status", "draft")
@@ -694,22 +700,21 @@ def main():
     cutoff = datetime.now() - timedelta(days=max_days)
 
     log.info(f"Engine started | age limit: {max_days} days | status: {post_status} | "
-             f"{len(target_urls)} portals")
+             f"{len(target_urls)} portals | Gemini cap: {MAX_GEMINI_PER_RUN}/run")
 
-    stats = {"created": 0, "skipped": 0, "errors": 0}
+    stats = {"created": 0, "skipped": 0, "errors": 0, "gemini": 0}
     seen = load_seen()
 
     try:
         check_wp_auth()
-        # Quick Gemini preflight: finds a working model or fails loudly right away
-        call_gemini(["Reply with the single word OK."], json_mode=False, max_retries=2)
-        log.info(f"Gemini OK using model: {MODEL_CANDIDATES[_active_model_idx]}")
 
         for url in target_urls:
             candidates = [p for p in find_pdf_links(url) if f"url:{p}" not in seen]
             log.info(f"  {len(candidates)} new document link(s) on this page.")
             for pdf_url in candidates[:MAX_PDFS_PER_PAGE]:
                 process_pdf(pdf_url, url, cutoff, post_status, seen, stats)
+    except RunLimit as e:
+        log.info(f"Stopping early: {e}")
     except FatalError as e:
         log.critical(f"STOPPED: {e}")
     except KeyboardInterrupt:
@@ -717,7 +722,7 @@ def main():
     finally:
         save_seen(seen)
         log.info(f"Done | created: {stats['created']} | skipped: {stats['skipped']} | "
-                 f"errors: {stats['errors']}")
+                 f"errors: {stats['errors']} | gemini calls: {stats['gemini']}")
 
 
 if __name__ == "__main__":
