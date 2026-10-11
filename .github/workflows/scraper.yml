@@ -36,6 +36,7 @@ jobs:
           WP_URL: ${{ secrets.WP_URL }}
           WP_USERNAME: ${{ secrets.WP_USERNAME }}
           WP_APPLICATION_PASSWORD: ${{ secrets.WP_APPLICATION_PASSWORD }}
+          MAX_PDFS_PER_PAGE: "2"
         run: python auto_scraper.py
 
       - name: Save seen list back to repo
