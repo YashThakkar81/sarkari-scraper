@@ -294,6 +294,10 @@ def _is_transient(e):
                                 "overloaded", "resource_exhausted", "deadline",
                                 "timed out", "timeout", "connection"))
 
+def _is_daily_quota(e):
+    t = _err_text(e)
+    return "perday" in t or "per day" in t
+
 
 def call_gemini(contents, json_mode=True, max_retries=4):
     global _active_model_idx
@@ -324,6 +328,10 @@ def call_gemini(contents, json_mode=True, max_retries=4):
                     raise FatalError(f"Gemini API key problem: {e}")
                 if _is_model_missing(e):
                     log.warning(f"Model '{model}' unavailable ({str(e)[:120]}). Trying next model...")
+                    _dead_models.add(model)
+                    break
+                if _is_daily_quota(e):
+                    log.warning(f"Daily quota exhausted for '{model}'. Trying next model...")
                     _dead_models.add(model)
                     break
                 if _is_transient(e) and attempt < max_retries:
