@@ -40,10 +40,14 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ---------------------------------------------------------------------------
 # 1. CONFIGURATION
 # ---------------------------------------------------------------------------
-WP_SITE_URL = "https://sarkarijobsguide.in"
-WP_USERNAME = os.environ.get("WP_USERNAME", "yashthakkar81@gmail.com")
-WP_APP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "3w8W qwGU 8DFF bQjM 8gv7 l8wt")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6LyR03t9eBaZX6cQMuX-yxLOv3bfSN8KJ_qPKyIKUcb_A")
+WP_SITE_URL = os.environ.get("WP_URL", "https://sarkarijobsguide.in").rstrip("/")
+WP_USERNAME = os.environ.get("WP_USERNAME", "")
+WP_APP_PASSWORD = (os.environ.get("WP_APPLICATION_PASSWORD")
+                   or os.environ.get("WP_APP_PASSWORD", ""))
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+if not (WP_USERNAME and WP_APP_PASSWORD and GEMINI_API_KEY):
+    sys.exit("Missing WP_USERNAME / WP_APPLICATION_PASSWORD / GEMINI_API_KEY.")
 
 SEEN_FILE = "seen_notifications.json"
 REVIEW_LOG = "needs_review.log"
