@@ -715,7 +715,10 @@ def process_pdf(pdf_url, source_page, cutoff, post_status, seen, stats, cap=None
 def get_query_queue():
     """Visitor job questions waiting on the website. Returns None if the feature is unavailable."""
     try:
-        r = requests.get(f"{WP_SITE_URL}/wp-json/sjn/v1/queue", auth=WP_AUTH, timeout=20)
+        # cache-buster + no-cache headers: host/CDN caches must never serve an old (empty) queue
+        r = requests.get(f"{WP_SITE_URL}/wp-json/sjn/v1/queue", auth=WP_AUTH, timeout=20,
+                         params={"_": int(time.time())},
+                         headers={"Cache-Control": "no-cache", "Pragma": "no-cache"})
     except Exception as e:
         log.warning(f"Visitor queue unavailable ({e}).")
         return None
@@ -726,9 +729,15 @@ def get_query_queue():
         log.warning(f"Visitor queue returned HTTP {r.status_code}; skipping.")
         return None
     try:
-        return r.json()
+        data = r.json()
     except ValueError:
+        log.warning(f"Visitor queue gave a non-JSON answer: {r.text[:150]!r}")
         return None
+    if isinstance(data, dict):
+        log.info(f"Visitor queue response: enabled={data.get('enabled')} | "
+                 f"waiting={len(data.get('items') or [])} | post status={data.get('post_status')} | "
+                 f"trusted only={data.get('trusted_only')}")
+    return data
 
 
 def report_query(qid, status, post_id=0, sources=None, note=""):
