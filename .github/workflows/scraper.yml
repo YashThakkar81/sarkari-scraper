@@ -16,37 +16,56 @@ concurrency:
 jobs:
   run-scraper:
     # Runs on your own Windows PC in India (the runner named india-pc).
-    # To go back to GitHub's servers, change this line to:  runs-on: ubuntu-latest
-    # (and change every "shell: powershell" below to "shell: bash")
+    # To go back to GitHub's servers: runs-on: ubuntu-latest, and change every "shell: powershell" to "shell: bash".
     runs-on: [self-hosted, windows]
     timeout-minutes: 45
 
-    # Windows PowerShell is built into Windows, so no extra program has to be found.
     defaults:
       run:
         shell: powershell
 
     env:
-      PYTHONUTF8: "1"                # lets Python print Hindi / the rupee sign in the Windows log
+      PYTHONUTF8: "1"
       PYTHONIOENCODING: "utf-8"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Uses the Python installed on the PC (no setup-python needed on a self-hosted runner).
-      - name: Check Python
+      # Finds a working Python on the PC (python, the "py" launcher, or the usual install folders)
+      # and remembers its full path for the next steps. Prints what it finds so problems are easy to read.
+      - name: Find Python
         run: |
           $ErrorActionPreference = 'Continue'
-          python --version
-          if ($LASTEXITCODE -ne 0) { Write-Host "Python was not found by the runner."; exit 1 }
-          python -m pip --version
-          if ($LASTEXITCODE -ne 0) { Write-Host "pip was not found."; exit 1 }
+          Write-Host "PATH entries mentioning Python:"
+          ($env:PATH -split ';') | Where-Object { $_ -match 'Python' } | ForEach-Object { Write-Host "  $_" }
+          $found = $null
+          foreach ($name in @('python', 'py')) {
+            $cmd = Get-Command $name -ErrorAction SilentlyContinue
+            if ($cmd -and $cmd.Source) {
+              $pyArgs = @()
+              if ($name -eq 'py') { $pyArgs = @('-3') }
+              $out = & $cmd.Source @pyArgs -c "import sys; print(sys.executable)" 2>$null
+              if ($LASTEXITCODE -eq 0 -and $out) { $found = ($out | Select-Object -First 1).Trim(); break }
+              Write-Host "'$name' exists at $($cmd.Source) but did not run (probably the Microsoft Store shortcut)."
+            }
+          }
+          if (-not $found) {
+            $paths = @(Get-ChildItem "$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe", "C:\Program Files\Python3*\python.exe", "C:\Python3*\python.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending)
+            if ($paths.Count -gt 0) { $found = $paths[0].FullName }
+          }
+          if (-not $found) {
+            Write-Host "ERROR: no working Python found on this PC. Install Python 3.11+ from python.org (tick 'Add python.exe to PATH'), then restart the runner."
+            exit 1
+          }
+          Write-Host "Using Python: $found"
+          "PYEXE=$found" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          & $found --version
 
       - name: Install dependencies
         run: |
           $ErrorActionPreference = 'Continue'
-          python -m pip install -r requirements.txt
+          & $env:PYEXE -m pip install -r requirements.txt
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Run Scraper
@@ -58,7 +77,7 @@ jobs:
           MAX_PDFS_PER_PAGE: "2"
         run: |
           $ErrorActionPreference = 'Continue'
-          python auto_scraper.py
+          & $env:PYEXE auto_scraper.py
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       # Saves the "already seen" list. Pulls first and retries, so a change made to the repo
@@ -67,6 +86,7 @@ jobs:
         if: always()
         run: |
           $ErrorActionPreference = 'Continue'
+          git --version
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config core.autocrlf false
