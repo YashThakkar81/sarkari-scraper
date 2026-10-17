@@ -216,12 +216,19 @@ SESSION = make_session()
 LINK_HINTS = (".pdf", "download", "viewdoc", "getfile", "attachment", "showfile", "openfile")
 
 
+_dead_hosts = set()   # websites that did not answer this run (many Indian government sites block cloud servers)
+
+
 def find_pdf_links(target_url):
     """Return candidate document links in page order (newest usually first)."""
+    dead_host = (urlparse(target_url).hostname or "").lower()
+    if dead_host in _dead_hosts:
+        log.info(f"Skipping {target_url}: {dead_host} did not answer earlier in this run.")
+        return []
     log.info(f"Scanning: {target_url}")
     links = []
     try:
-        r = SESSION.get(target_url, timeout=25)
+        r = SESSION.get(target_url, timeout=(15, 30))
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         for a in soup.find_all("a", href=True):
@@ -232,6 +239,8 @@ def find_pdf_links(target_url):
                 links.append(urljoin(target_url, href))
     except Exception as e:
         log.error(f"Scraper error on {target_url}: {e}")
+        if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+            _dead_hosts.add(dead_host)
         return []
     links = list(dict.fromkeys(links))  # de-duplicate, keep order
     if not links:
@@ -823,6 +832,22 @@ def find_official_pages(query):
 KEYWORD_RE = re.compile(r"recruit|career|advert|notif|vacanc|opening|employment|jobs?", re.I)
 
 
+JOB_WORDS_RE = re.compile(r"recruit|advert|advt|notif|vacanc|apply|application|bharti|exam|post|constable|"
+                          r"tradesm|officer|engineer|teacher|clerk|assistant|operator|driver|nurse|"
+                          r"inspector|agniveer|agnipath|result_?of_?selection", re.I)
+NOT_JOB_RE = re.compile(r"message|\bmsg\b|speech|tender|quotation|result|admit|hall_?ticket|syllabus|answer|"
+                        r"\bkey\b|circular|policy|annual|report|rti|newsletter|calendar|brochure|"
+                        r"magazine|budget|holiday|order|minutes|oath|pledge|award|gazette|manual", re.I)
+
+
+def looks_like_job_pdf(url):
+    """Cheap filename check so visitor-question runs do not spend Gemini calls on messages, tenders, results..."""
+    name = re.sub(r"[%_\-\.+/]+", " ", urlparse(url).path.lower())
+    if JOB_WORDS_RE.search(name):
+        return True
+    return not NOT_JOB_RE.search(name)
+
+
 def find_pdf_links_deep(page_url, max_sub=3):
     """PDF links on the page; if there are none, also look one level down on the same website
     (links such as 'Recruitment', 'Careers', 'Advertisement', 'Notifications')."""
@@ -830,9 +855,11 @@ def find_pdf_links_deep(page_url, max_sub=3):
     if links:
         return links
     host = urlparse(page_url).hostname
+    if (host or "").lower() in _dead_hosts:
+        return []
     subs = []
     try:
-        r = SESSION.get(page_url, timeout=25)
+        r = SESSION.get(page_url, timeout=(15, 30))
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         for a in soup.find_all("a", href=True):
@@ -896,7 +923,11 @@ def process_user_queries(seen, default_status, default_cutoff):
                     candidates = [page]
                     origin = f"{urlparse(page).scheme}://{urlparse(page).netloc}/"
                 else:
-                    candidates = [p for p in find_pdf_links_deep(page) if f"url:{p}" not in seen]
+                    all_links = [p for p in find_pdf_links_deep(page) if f"url:{p}" not in seen]
+                    candidates = [p for p in all_links if looks_like_job_pdf(p)]
+                    if len(candidates) < len(all_links):
+                        log.info(f"  Ignored {len(all_links) - len(candidates)} PDF(s) that look like "
+                                 f"messages / tenders / results.")
                     origin = page
                 for pdf_url in candidates[:MAX_PDFS_PER_PAGE]:
                     process_pdf(pdf_url, origin, default_cutoff, status, seen, qstats,
