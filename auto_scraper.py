@@ -16,7 +16,8 @@ Credentials come from environment variables (GitHub Secrets in Actions):
 Optional:
     GEMINI_MODEL            -> force a specific model, e.g. gemini-3.6-flash
     MAX_PDFS_PER_PAGE       (default 5)
-    MAX_GEMINI_PER_RUN      (default 3) -> max PDFs sent to Gemini for the normal portal scan
+    MAX_GEMINI_PER_RUN      (default 12) -> max PDFs sent to Gemini for the normal portal scan
+    MAX_GEMINI_PER_PORTAL   (default 2)  -> max PDFs sent to Gemini per portal, so one portal cannot use the whole budget
     MAX_QUERIES_PER_RUN     (default 3) -> visitor questions handled per run
     MAX_QUERY_PDFS_PER_RUN  (default 3) -> PDFs sent to Gemini for visitor questions per run
 """
@@ -32,6 +33,7 @@ import random
 import hashlib
 import logging
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -58,7 +60,8 @@ if not (WP_USERNAME and WP_APP_PASSWORD and GEMINI_API_KEY):
 SEEN_FILE = "seen_notifications.json"
 REVIEW_LOG = "needs_review.log"
 MAX_PDFS_PER_PAGE = int(os.environ.get("MAX_PDFS_PER_PAGE", "5"))
-MAX_GEMINI_PER_RUN = int(os.environ.get("MAX_GEMINI_PER_RUN", "3"))
+MAX_GEMINI_PER_RUN = int(os.environ.get("MAX_GEMINI_PER_RUN", "12"))
+MAX_GEMINI_PER_PORTAL = int(os.environ.get("MAX_GEMINI_PER_PORTAL", "2"))
 MAX_QUERIES_PER_RUN = int(os.environ.get("MAX_QUERIES_PER_RUN", "3"))
 MAX_QUERY_PDFS_PER_RUN = int(os.environ.get("MAX_QUERY_PDFS_PER_RUN", "3"))
 INLINE_PDF_LIMIT = 18 * 1024 * 1024      # above this, use the Gemini Files API
@@ -123,7 +126,7 @@ FALLBACK_SETTINGS = {
         "https://hpsc.gov.in/en-us/Instructions",
         "https://ppsc.gov.in/Advertisement/openadv.aspx?id=1",
         "https://www.upsc.gov.in/recruitment/recruitment-advertisement",
-        "https://hppsc.hp.gov.in/CommonControls/ViewContinuousLinkPage?qs=mhlKjiXMMItGo46f60VBXX8%2B1SQ83OzVLj9MfDScpvboDSdMygkK4iLV47Bu%2FJzMpJLanI%2BihrK9p8W6JsSQUgHTy39NyiuO%BFtbEmiPQyc%3D",
+        "https://hppsc.hp.gov.in/CommonControls/ViewContinuousLinkPage?qs=mhlKjiXMMItGo46f60VBXX8%2B1SQ83OzVLj9MfDScpvboDSdMygkK4iLV47Bu%2FJzMpJLanI%2BihrK9p8W6JsSQUgHTy39NyiuO%2BFtbEmiPQyc%3D",
         "https://apsc.nic.in/advt_2026.php#advertisement",
         "https://mpsc.mizoram.gov.in/category/notifications",
         "https://www.ossc.gov.in/Public/OSSC/Default.aspx",
@@ -216,6 +219,7 @@ SESSION = make_session()
 LINK_HINTS = (".pdf", "download", "viewdoc", "getfile", "attachment", "showfile", "openfile")
 
 
+_LINK_TEXT = {}       # link address -> the words shown on the page for it
 _dead_hosts = set()   # websites that did not answer this run (many Indian government sites block cloud servers)
 
 
@@ -236,7 +240,11 @@ def find_pdf_links(target_url):
             if href.lower().startswith(("javascript:", "mailto:", "#", "tel:")):
                 continue
             if any(h in href.lower() for h in LINK_HINTS):
-                links.append(urljoin(target_url, href))
+                full = urljoin(target_url, href)
+                links.append(full)
+                txt = a.get_text(" ", strip=True)
+                if txt and len(txt) > len(_LINK_TEXT.get(full, "")):
+                    _LINK_TEXT[full] = txt[:300]
     except Exception as e:
         log.error(f"Scraper error on {target_url}: {e}")
         if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
@@ -256,7 +264,7 @@ def download_pdf(pdf_url):
         raise ValueError("not a PDF file")
     if len(content) > MAX_PDF_SIZE:
         raise ValueError(f"PDF too large ({len(content)//1024//1024} MB)")
-    return content
+    return content, r.headers.get("Last-Modified")
 
 
 # ---------------------------------------------------------------------------
@@ -630,10 +638,15 @@ def process_pdf(pdf_url, source_page, cutoff, post_status, seen, stats, cap=None
     url_key = f"url:{pdf_url}"
     if url_key in seen:
         return
+    if not looks_like_job_pdf(pdf_url):
+        log.info(f"Skipping (name looks like a message / tender / result): {pdf_url}")
+        mark_seen(seen, url_key)
+        stats["skipped"] += 1
+        return
     log.info(f"Checking: {pdf_url}")
 
     try:
-        pdf_bytes = download_pdf(pdf_url)
+        pdf_bytes, last_modified = download_pdf(pdf_url)
     except ValueError as e:                       # permanent: not a PDF / too big
         log.info(f"  Skipped ({e}).")
         mark_seen(seen, url_key)
@@ -648,6 +661,18 @@ def process_pdf(pdf_url, source_page, cutoff, post_status, seen, stats, cap=None
         log.info("  Same PDF already processed under another URL.")
         mark_seen(seen, url_key)
         return
+
+    # Old files cost nothing: the server says when the file was last changed (14-day safety margin)
+    if last_modified:
+        try:
+            lm = parsedate_to_datetime(last_modified).replace(tzinfo=None)
+            if lm < cutoff - timedelta(days=14):
+                log.info(f"  Old file (last changed {lm:%Y-%m-%d}); skipped without using Gemini.")
+                mark_seen(seen, url_key, sha_key)
+                stats["skipped"] += 1
+                return
+        except Exception:
+            pass
 
     # Per-run cap on Gemini requests (protects the free daily quota)
     if stats["gemini"] >= cap:
@@ -842,7 +867,7 @@ NOT_JOB_RE = re.compile(r"message|\bmsg\b|speech|tender|quotation|result|admit|h
 
 def looks_like_job_pdf(url):
     """Cheap filename check so visitor-question runs do not spend Gemini calls on messages, tenders, results..."""
-    name = re.sub(r"[%_\-\.+/]+", " ", urlparse(url).path.lower())
+    name = re.sub(r"[%_\-\.+/]+", " ", urlparse(url).path.lower()) + " " + _LINK_TEXT.get(url, "").lower()
     if JOB_WORDS_RE.search(name):
         return True
     return not NOT_JOB_RE.search(name)
@@ -974,15 +999,50 @@ def main():
     try:
         check_wp_auth()
 
-        # Part 1: your normal list of portals
+        # Part 1: your normal list of portals.
+        # Every portal gets a small Gemini budget, and the start point rotates between runs, so no portal
+        # (and no pile of old PDFs on one portal) can starve the others.
+        n = len(target_urls)
         try:
-            for url in target_urls:
-                candidates = [p for p in find_pdf_links(url) if f"url:{p}" not in seen]
+            start = int(seen.get("cursor:portal", "0")) % n
+        except (TypeError, ValueError):
+            start = 0
+        order = list(range(start, n)) + list(range(0, start))
+        report = {}
+        stopped_at = None
+        idx = start
+        try:
+            for idx in order:
+                url = target_urls[idx]
+                links = find_pdf_links(url)
+                candidates = [p for p in links if f"url:{p}" not in seen]
+                host = (urlparse(url).hostname or "").lower()
+                if host in _dead_hosts:
+                    report[url] = "UNREACHABLE from this server (blocked or timed out)"
+                elif not links:
+                    report[url] = "no document links found (JavaScript page?)"
+                else:
+                    report[url] = f"{len(candidates)} new of {len(links)} links"
                 log.info(f"  {len(candidates)} new document link(s) on this page.")
-                for pdf_url in candidates[:MAX_PDFS_PER_PAGE]:
+                used = 0
+                created_before = stats["created"]
+                for pdf_url in candidates[:MAX_PDFS_PER_PAGE * 3]:
+                    g0 = stats["gemini"]
                     process_pdf(pdf_url, url, cutoff, post_status, seen, stats)
+                    used += stats["gemini"] - g0
+                    if used >= MAX_GEMINI_PER_PORTAL:
+                        break
+                if stats["created"] > created_before:
+                    report[url] += f" | CREATED {stats['created'] - created_before} post(s)"
         except RunLimit as e:
-            log.info(f"Portal scan stopped early: {e}")
+            stopped_at = idx
+            log.info(f"Portal scan stopped early at portal #{idx + 1}: {e}")
+        seen["cursor:portal"] = str(stopped_at if stopped_at is not None else 0)
+        log.info("PORTAL REPORT (what happened on each portal this run):")
+        for u, msg in report.items():
+            log.info(f"  - {u[:90]}  ->  {msg}")
+        if stopped_at is not None:
+            log.info(f"  Next run starts again at portal #{stopped_at + 1}.")
 
         # Part 2: job questions from visitors (has its own limits, so it always gets a turn)
         process_user_queries(seen, post_status, cutoff)
