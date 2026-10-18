@@ -81,6 +81,9 @@ jobs:
           WP_USERNAME: ${{ secrets.WP_USERNAME }}
           WP_APPLICATION_PASSWORD: ${{ secrets.WP_APPLICATION_PASSWORD }}
           MAX_PDFS_PER_PAGE: "2"
+          # One-time: check MPPSC again, because its Law Officer advertisement was skipped earlier while the
+          # age limit was still 7 days. DELETE this line after the first successful run.
+          FORCE_RECHECK: "mppsc.mp.gov.in"
           # MAX_GEMINI_PER_RUN: "20"      # remove the # to check more portals per run (uses more Gemini quota)
           # USE_BROWSER: "0"             # remove the # to switch the browser reader off
         run: |
