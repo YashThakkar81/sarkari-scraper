@@ -21,6 +21,7 @@ Optional:
     MAX_AGE_DAYS            (optional) -> overrides the age limit from the WordPress panel (e.g. 30)
     USE_BROWSER             (default 1)  -> 0 switches the real-browser reader (Playwright) off
     MAX_BROWSER_PAGES       (default 12) -> browser page loads per run
+    FORCE_RECHECK           (optional) -> parts of web addresses to check again even if seen before, e.g. mppsc.mp.gov.in
     MAX_QUERIES_PER_RUN     (default 3) -> visitor questions handled per run
     MAX_QUERY_PDFS_PER_RUN  (default 3) -> PDFs sent to Gemini for visitor questions per run
 """
@@ -220,7 +221,8 @@ def make_session():
 
 SESSION = make_session()
 
-LINK_HINTS = (".pdf", "download", "viewdoc", "getfile", "attachment", "showfile", "openfile")
+LINK_HINTS = (".pdf", "download", "viewdoc", "getfile", "attachment", "showfile", "openfile",
+              "fileview", "viewfile", "cmsfile", "viewdocument", "getdocument", "viewpdf", "openpdf", "showpdf")
 
 
 _LINK_TEXT = {}       # link address -> the words shown on the page for it
@@ -503,6 +505,34 @@ def mark_seen(seen, *keys):
         if k:
             seen[k] = now
     save_seen(seen)
+
+
+FORCE_RECHECK = [x.strip() for x in os.environ.get("FORCE_RECHECK", "").split(",") if x.strip()]
+
+
+def mark_old(seen, date_str, *keys):
+    """Skipped only because it looked too old. Stored with that date, so it is checked again
+    if you later raise the age limit (see is_seen)."""
+    for k in keys:
+        if k:
+            seen[k] = f"old:{date_str}"
+    save_seen(seen)
+
+
+def is_seen(seen, key, cutoff, url=""):
+    """True if this item was handled before.
+    - FORCE_RECHECK (env, comma separated parts of web addresses) makes matching items count as new.
+    - An item that was skipped only for being too old counts as new again when the age limit now allows it."""
+    if url and any(f in url for f in FORCE_RECHECK):
+        return False
+    v = seen.get(key)
+    if v is None:
+        return False
+    if isinstance(v, str) and v.startswith("old:"):
+        d = parse_date(v[4:])
+        if d and d >= cutoff:
+            return False
+    return True
 
 
 def log_for_review(pdf_url, reason):
@@ -847,7 +877,7 @@ def create_wordpress_post(data, pdf_url, source_page, post_status):
 def process_pdf(pdf_url, source_page, cutoff, post_status, seen, stats, cap=None):
     cap = MAX_GEMINI_PER_RUN if cap is None else cap
     url_key = f"url:{pdf_url}"
-    if url_key in seen:
+    if is_seen(seen, url_key, cutoff, pdf_url):
         return
     if not looks_like_job_pdf(pdf_url):
         log.info(f"Skipping (name looks like a message / tender / result): {pdf_url}")
@@ -874,7 +904,7 @@ def process_pdf(pdf_url, source_page, cutoff, post_status, seen, stats, cap=None
         return
 
     sha_key = "sha:" + hashlib.sha256(pdf_bytes).hexdigest()
-    if sha_key in seen:
+    if is_seen(seen, sha_key, cutoff, pdf_url):
         log.info("  Same PDF already processed under another URL.")
         mark_seen(seen, url_key)
         return
@@ -885,7 +915,7 @@ def process_pdf(pdf_url, source_page, cutoff, post_status, seen, stats, cap=None
             lm = parsedate_to_datetime(last_modified).replace(tzinfo=None)
             if lm < cutoff - timedelta(days=14):
                 log.info(f"  Old file (last changed {lm:%Y-%m-%d}); skipped without using Gemini.")
-                mark_seen(seen, url_key, sha_key)
+                mark_old(seen, f"{lm + timedelta(days=14):%Y-%m-%d}", url_key, sha_key)
                 stats["skipped"] += 1
                 return
         except Exception:
@@ -933,7 +963,7 @@ def process_pdf(pdf_url, source_page, cutoff, post_status, seen, stats, cap=None
         return
     if issued < cutoff:
         log.info(f"  Old notice ({issued:%Y-%m-%d}); skipped.")
-        mark_seen(seen, url_key, sha_key)
+        mark_old(seen, f"{issued:%Y-%m-%d}", url_key, sha_key)
         stats["skipped"] += 1
         return
 
@@ -1163,7 +1193,7 @@ def process_user_queries(seen, default_status, default_cutoff):
                     candidates = [page]
                     origin = f"{urlparse(page).scheme}://{urlparse(page).netloc}/"
                 else:
-                    all_links = [p for p in find_pdf_links_deep(page) if f"url:{p}" not in seen]
+                    all_links = [p for p in find_pdf_links_deep(page) if not is_seen(seen, f"url:{p}", default_cutoff, p)]
                     candidates = [p for p in all_links if looks_like_job_pdf(p)]
                     if len(candidates) < len(all_links):
                         log.info(f"  Ignored {len(all_links) - len(candidates)} PDF(s) that look like "
@@ -1232,7 +1262,7 @@ def main():
             for idx in order:
                 url = target_urls[idx]
                 links = find_pdf_links(url)
-                candidates = [p for p in links if f"url:{p}" not in seen]
+                candidates = [p for p in links if not is_seen(seen, f"url:{p}", cutoff, p)]
                 host = (urlparse(url).hostname or "").lower()
                 if host in _dead_hosts:
                     report[url] = "UNREACHABLE from this server (blocked or timed out)"
