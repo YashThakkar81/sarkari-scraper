@@ -19,6 +19,8 @@ Optional:
     MAX_GEMINI_PER_RUN      (default 12) -> max PDFs sent to Gemini for the normal portal scan
     MAX_GEMINI_PER_PORTAL   (default 2)  -> max PDFs sent to Gemini per portal, so one portal cannot use the whole budget
     MAX_AGE_DAYS            (optional) -> overrides the age limit from the WordPress panel (e.g. 30)
+    USE_BROWSER             (default 1)  -> 0 switches the real-browser reader (Playwright) off
+    MAX_BROWSER_PAGES       (default 12) -> browser page loads per run
     MAX_QUERIES_PER_RUN     (default 3) -> visitor questions handled per run
     MAX_QUERY_PDFS_PER_RUN  (default 3) -> PDFs sent to Gemini for visitor questions per run
 """
@@ -222,43 +224,221 @@ LINK_HINTS = (".pdf", "download", "viewdoc", "getfile", "attachment", "showfile"
 
 _LINK_TEXT = {}       # link address -> the words shown on the page for it
 _dead_hosts = set()   # websites that did not answer this run (many Indian government sites block cloud servers)
+_BROWSER_HOSTS = set()  # websites that only worked through the real browser
+
+# ---------------------------------------------------------------------------
+# 3b. REAL BROWSER READER (optional, uses Playwright + the Chrome installed on this PC)
+#     Used only when the normal request is blocked (HTTP 403 etc.) or the page builds its list with
+#     JavaScript. If Playwright is not installed the script simply carries on without it.
+#     USE_BROWSER=0 switches it off; MAX_BROWSER_PAGES (default 12) limits browser page loads per run.
+# ---------------------------------------------------------------------------
+USE_BROWSER = os.environ.get("USE_BROWSER", "1").strip().lower() not in ("0", "false", "no", "off")
+MAX_BROWSER_PAGES = int(os.environ.get("MAX_BROWSER_PAGES", "12"))
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+BLOCK_CODES = (401, 403, 406, 429, 503)
+
+_pw = _browser = _context = None
+_browser_failed = False
+_browser_pages = 0
+
+
+def _browser_close():
+    global _pw, _browser, _context
+    for obj, meth in ((_context, "close"), (_browser, "close"), (_pw, "stop")):
+        try:
+            if obj is not None:
+                getattr(obj, meth)()
+        except Exception:
+            pass
+    _pw = _browser = _context = None
+
+
+def _browser_ready():
+    """Start the browser the first time it is needed. Returns False if it cannot be used."""
+    global _pw, _browser, _context, _browser_failed
+    if not USE_BROWSER or _browser_failed:
+        return False
+    if _context is not None:
+        return True
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log.info("Browser reader is not installed (pip install playwright); carrying on without it.")
+        _browser_failed = True
+        return False
+    try:
+        _pw = sync_playwright().start()
+        args = ["--disable-blink-features=AutomationControlled"]
+        browser = None
+        for extra in ({"channel": "chrome"}, {}):          # your installed Chrome first, then Playwright's own
+            try:
+                browser = _pw.chromium.launch(headless=True, args=args, **extra)
+                break
+            except Exception as e:
+                log.info(f"  Browser start ({extra.get('channel', 'chromium')}) failed: {str(e)[:120]}")
+        if browser is None:
+            raise RuntimeError("no browser could be started (try: python -m playwright install chromium)")
+        _browser = browser
+        _context = browser.new_context(user_agent=BROWSER_UA, locale="en-IN", timezone_id="Asia/Kolkata",
+                                       ignore_https_errors=True, viewport={"width": 1366, "height": 900})
+        _context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+        log.info("Browser reader ready.")
+        return True
+    except Exception as e:
+        log.warning(f"Browser reader unavailable: {str(e)[:200]}")
+        _browser_failed = True
+        _browser_close()
+        return False
+
+
+def browser_html(url):
+    """Rendered HTML of a page (after its JavaScript ran). Returns (html, final_url) or None."""
+    global _browser_pages
+    if _browser_pages >= MAX_BROWSER_PAGES or not _browser_ready():
+        return None
+    _browser_pages += 1
+    page = None
+    try:
+        log.info(f"  Opening in the browser reader: {url[:100]}")
+        page = _context.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+        page.wait_for_timeout(1500)
+        return page.content(), page.url
+    except Exception as e:
+        log.warning(f"  Browser reader could not open the page: {str(e)[:150]}")
+        return None
+    finally:
+        try:
+            if page is not None:
+                page.close()
+        except Exception:
+            pass
+
+
+_FETCH_JS = """async (u) => {
+  const r = await fetch(u, {credentials: 'include'});
+  if (!r.ok) return {status: r.status};
+  const b = new Uint8Array(await r.arrayBuffer());
+  let s = ''; const C = 0x8000;
+  for (let i = 0; i < b.length; i += C) s += String.fromCharCode.apply(null, b.subarray(i, i + C));
+  return {status: r.status, lm: r.headers.get('last-modified'), b64: btoa(s)};
+}"""
+
+
+def browser_download(url):
+    """Download a file through the browser (cookies and all). Returns (bytes, last_modified) or None."""
+    import base64
+    if not _browser_ready():
+        return None
+    try:                                              # 1) the browser's request channel
+        resp = _context.request.get(url, timeout=60000)
+        if resp.ok:
+            body = resp.body()
+            if body[:1024].lstrip().startswith(b"%PDF"):
+                return body, resp.headers.get("last-modified")
+    except Exception as e:
+        log.info(f"  Browser download (direct) failed: {str(e)[:100]}")
+    page = None
+    try:                                              # 2) fetch() from a page of the same website
+        origin = f"{urlparse(url).scheme}://{urlparse(url).netloc}/"
+        page = _context.new_page()
+        page.goto(origin, wait_until="domcontentloaded", timeout=45000)
+        res = page.evaluate(_FETCH_JS, url)
+        if res and res.get("b64"):
+            body = base64.b64decode(res["b64"])
+            return body, res.get("lm")
+    except Exception as e:
+        log.info(f"  Browser download (page fetch) failed: {str(e)[:100]}")
+    finally:
+        try:
+            if page is not None:
+                page.close()
+        except Exception:
+            pass
+    return None
+
+
+def _extract_doc_links(html, base_url):
+    """Document links in an HTML page: normal links, iframe/embed/object files, and .pdf addresses
+    written inside the page's JavaScript / JSON. Returns (links, soup)."""
+    soup = BeautifulSoup(html, "html.parser")
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.lower().startswith(("javascript:", "mailto:", "#", "tel:")):
+            continue
+        if any(h in href.lower() for h in LINK_HINTS):
+            full = urljoin(base_url, href)
+            links.append(full)
+            txt = a.get_text(" ", strip=True)
+            if txt and len(txt) > len(_LINK_TEXT.get(full, "")):
+                _LINK_TEXT[full] = txt[:300]
+    for tag, attr in (("iframe", "src"), ("embed", "src"), ("object", "data")):
+        for el in soup.find_all(tag):
+            v = (el.get(attr) or "").strip()
+            if ".pdf" in v.lower():
+                links.append(urljoin(base_url, v))
+    for m in re.finditer(r"""["'(=]\s*([^"'\s<>()]+?\.pdf(?:\?[^"'\s<>()]*)?)""", html, flags=re.I):
+        v = m.group(1).replace("\\/", "/")
+        if not v.lower().startswith(("javascript:", "data:")):
+            links.append(urljoin(base_url, v))
+    return list(dict.fromkeys(links)), soup
+
+
+def fetch_page(url):
+    """HTML of a page: a normal request first, the real browser if the site blocks it."""
+    try:
+        r = SESSION.get(url, timeout=(15, 30))
+        r.raise_for_status()
+        return r.text
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        raise
+    except Exception:
+        got = browser_html(url)
+        if got:
+            return got[0]
+        raise
 
 
 def find_pdf_links(target_url):
     """Return candidate document links in page order (newest usually first)."""
-    dead_host = (urlparse(target_url).hostname or "").lower()
-    if dead_host in _dead_hosts:
-        log.info(f"Skipping {target_url}: {dead_host} did not answer earlier in this run.")
+    host = (urlparse(target_url).hostname or "").lower()
+    if host in _dead_hosts:
+        log.info(f"Skipping {target_url}: {host} did not answer earlier in this run.")
         return []
     log.info(f"Scanning: {target_url}")
-    links = []
+    html = None
     try:
         r = SESSION.get(target_url, timeout=(15, 30))
         r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            if href.lower().startswith(("javascript:", "mailto:", "#", "tel:")):
-                continue
-            if any(h in href.lower() for h in LINK_HINTS):
-                full = urljoin(target_url, href)
-                links.append(full)
-                txt = a.get_text(" ", strip=True)
-                if txt and len(txt) > len(_LINK_TEXT.get(full, "")):
-                    _LINK_TEXT[full] = txt[:300]
-        # PDF files placed in <iframe>/<embed>/<object>, or written inside the page's JavaScript / JSON
-        # (many "JavaScript" tables keep their PDF addresses in the page source).
-        for tag, attr in (("iframe", "src"), ("embed", "src"), ("object", "data")):
-            for el in soup.find_all(tag):
-                v = (el.get(attr) or "").strip()
-                if ".pdf" in v.lower():
-                    links.append(urljoin(target_url, v))
-        for m in re.finditer(r"""["'(=]\s*([^"'\s<>()]+?\.pdf(?:\?[^"'\s<>()]*)?)""", r.text, flags=re.I):
-            v = m.group(1).replace("\\/", "/")
-            if not v.lower().startswith(("javascript:", "data:")):
-                links.append(urljoin(target_url, v))
-        if not any(l for l in links):
-            sample = []
+        html = r.text
+    except Exception as e:
+        log.error(f"Scraper error on {target_url}: {e}")
+        if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+            _dead_hosts.add(host)
+            return []
+
+    links, soup = ([], None)
+    if html is not None:
+        links, soup = _extract_doc_links(html, target_url)
+    if not links:      # blocked (403 ...), or a page that builds its list with JavaScript
+        got = browser_html(target_url)
+        if got:
+            blinks, bsoup = _extract_doc_links(got[0], got[1] or target_url)
+            if blinks:
+                log.info(f"  Browser reader found {len(blinks)} document link(s).")
+                links, soup = blinks, bsoup
+                _BROWSER_HOSTS.add(host)
+            elif soup is None:
+                soup = bsoup
+    if not links:
+        sample = []
+        if soup is not None:
             for a in soup.find_all("a", href=True):
                 t = a.get_text(" ", strip=True)
                 if re.search(r"pdf|download|advert|notif|recruit|vacanc|click here", t + " " + a["href"], re.I):
@@ -267,26 +447,34 @@ def find_pdf_links(target_url):
                     break
             log.info(f"  Page has {len(soup.find_all('a'))} links, none look like documents. "
                      f"Possibly relevant links: {sample or 'none'}")
-    except Exception as e:
-        log.error(f"Scraper error on {target_url}: {e}")
-        if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
-            _dead_hosts.add(dead_host)
-        return []
-    links = list(dict.fromkeys(links))  # de-duplicate, keep order
-    if not links:
-        log.info("  No document links found (page may be JavaScript-rendered).")
+        else:
+            log.info("  No document links found and the page could not be read.")
     return links
 
 
 def download_pdf(pdf_url):
-    r = SESSION.get(pdf_url, timeout=45)
-    r.raise_for_status()
-    content = r.content
-    if not content[:1024].lstrip().startswith(b"%PDF"):
+    host = (urlparse(pdf_url).hostname or "").lower()
+    content, last_modified, err = None, None, None
+    try:
+        r = SESSION.get(pdf_url, timeout=45)
+        r.raise_for_status()
+        content, last_modified = r.content, r.headers.get("Last-Modified")
+    except requests.exceptions.HTTPError as e:
+        err = e
+    blocked = err is not None and getattr(err.response, "status_code", None) in BLOCK_CODES
+    not_pdf = content is not None and not content[:1024].lstrip().startswith(b"%PDF")
+    if blocked or (not_pdf and host in _BROWSER_HOSTS):
+        got = browser_download(pdf_url)          # the real browser may be let in where a script is not
+        if got:
+            content, last_modified = got
+            err = None
+    if err is not None:
+        raise err
+    if content is None or not content[:1024].lstrip().startswith(b"%PDF"):
         raise ValueError("not a PDF file")
     if len(content) > MAX_PDF_SIZE:
         raise ValueError(f"PDF too large ({len(content)//1024//1024} MB)")
-    return content, r.headers.get("Last-Modified")
+    return content, last_modified
 
 
 # ---------------------------------------------------------------------------
@@ -673,8 +861,14 @@ def process_pdf(pdf_url, source_page, cutoff, post_status, seen, stats, cap=None
         log.info(f"  Skipped ({e}).")
         mark_seen(seen, url_key)
         return
-    except Exception as e:                        # network problem: retry next run
-        log.warning(f"  Download failed: {e}")
+    except Exception as e:
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        if code in (404, 410):                    # the file is gone for good: never try this link again
+            log.info(f"  Link no longer exists (HTTP {code}); will not try again.")
+            mark_seen(seen, url_key)
+            stats["skipped"] += 1
+            return
+        log.warning(f"  Download failed: {e}")    # temporary problem: retry next run
         stats["errors"] += 1
         return
 
@@ -906,9 +1100,7 @@ def find_pdf_links_deep(page_url, max_sub=3):
         return []
     subs = []
     try:
-        r = SESSION.get(page_url, timeout=(15, 30))
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
+        soup = BeautifulSoup(fetch_page(page_url), "html.parser")
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
             if href.lower().startswith(("javascript:", "mailto:", "#", "tel:")):
@@ -1076,6 +1268,7 @@ def main():
     except KeyboardInterrupt:
         log.info("Interrupted by user.")
     finally:
+        _browser_close()
         save_seen(seen)
         log.info(f"Done | created: {stats['created']} | skipped: {stats['skipped']} | "
                  f"errors: {stats['errors']} | gemini calls: {stats['gemini']}")
