@@ -20,7 +20,7 @@ Optional:
     MAX_GEMINI_PER_PORTAL   (default 2)  -> max PDFs sent to Gemini per portal, so one portal cannot use the whole budget
     MAX_AGE_DAYS            (optional) -> overrides the age limit from the WordPress panel (e.g. 30)
     USE_BROWSER             (default 1)  -> 0 switches the real-browser reader (Playwright) off
-    MAX_BROWSER_PAGES       (default 12) -> browser page loads per run
+    MAX_BROWSER_PAGES       (default 20) -> browser page loads per run
     FORCE_RECHECK           (optional) -> parts of web addresses to check again even if seen before, e.g. mppsc.mp.gov.in
     MAX_QUERIES_PER_RUN     (default 3) -> visitor questions handled per run
     MAX_QUERY_PDFS_PER_RUN  (default 3) -> PDFs sent to Gemini for visitor questions per run
@@ -119,7 +119,6 @@ FALLBACK_SETTINGS = {
         "https://mppsc.mp.gov.in/Advertisement",
         "https://psc.uk.gov.in/candidate-corner/recruitment",
         "https://rpsc.rajasthan.gov.in/advertisements",
-        "https://rpsc.rajasthan.gov.in/viewcommon?Slice=RA",
         "https://uppsc.up.nic.in/CandidatePages/Notifications.aspx",
         "https://gpsc.goa.gov.in/advertisements/",
         "https://mpscmanipur.gov.in/whats_new.html",
@@ -222,7 +221,8 @@ def make_session():
 SESSION = make_session()
 
 LINK_HINTS = (".pdf", "download", "viewdoc", "getfile", "attachment", "showfile", "openfile",
-              "fileview", "viewfile", "cmsfile", "viewdocument", "getdocument", "viewpdf", "openpdf", "showpdf")
+              "fileview", "viewfile", "cmsfile", "viewdocument", "getdocument", "viewpdf", "openpdf", "showpdf",
+              "view_advertisement", "viewadvertisement")
 
 
 _LINK_TEXT = {}       # link address -> the words shown on the page for it
@@ -236,10 +236,17 @@ _BROWSER_HOSTS = set()  # websites that only worked through the real browser
 #     USE_BROWSER=0 switches it off; MAX_BROWSER_PAGES (default 12) limits browser page loads per run.
 # ---------------------------------------------------------------------------
 USE_BROWSER = os.environ.get("USE_BROWSER", "1").strip().lower() not in ("0", "false", "no", "off")
-MAX_BROWSER_PAGES = int(os.environ.get("MAX_BROWSER_PAGES", "12"))
+MAX_BROWSER_PAGES = int(os.environ.get("MAX_BROWSER_PAGES", "20"))
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 BLOCK_CODES = (401, 403, 406, 429, 503)
+
+# A "strong" link clearly points at a file (".pdf", "CMSFileView", ...). A word like "download" alone
+# (a menu item such as "Download Formats") is only a weak hint.
+STRONG_RE = re.compile(r"\.pdf(?:$|[?#])|fileview|cmsfile|viewfile|viewdocument|getdocument|viewdoc|showfile|"
+                       r"openfile|getfile|viewpdf|openpdf|showpdf|view_advertisement|viewadvertisement|attachment", re.I)
+CLICK_TEXT_RE = re.compile(r"view\s*pdf|download|click\s*here|view\s*(?:notice|advert|notification|detail)", re.I)
+_CLICK_PAGES = set()   # pages whose "View PDF" buttons run JavaScript; these are opened and clicked in the browser
 
 _pw = _browser = _context = None
 _browser_failed = False
@@ -366,6 +373,102 @@ def browser_download(url):
     return None
 
 
+def browser_click_capture(page_url, max_items=4):
+    """For pages whose 'View PDF' / 'Click Here' buttons run JavaScript (for example ASP.NET postbacks):
+    click the first few buttons and capture the PDF that each one opens or downloads.
+    Returns a list of (label_url, pdf_bytes, last_modified)."""
+    global _browser_pages
+    if _browser_pages >= MAX_BROWSER_PAGES or not _browser_ready():
+        return []
+    _browser_pages += 1
+    found = []
+    captured = []
+
+    def on_response(resp):
+        try:
+            ct = (resp.headers.get("content-type") or "").lower()
+            if "pdf" in ct or resp.url.lower().split("?")[0].endswith(".pdf"):
+                captured.append(resp)
+        except Exception:
+            pass
+
+    bodies = []
+
+    def route_handler(route, request):
+        try:
+            if request.method == "POST" and request.resource_type == "document":
+                resp = route.fetch()
+                data = resp.body()
+                ct = (resp.headers.get("content-type") or "").lower()
+                if "pdf" in ct or data[:1024].lstrip().startswith(b"%PDF"):
+                    bodies.append((data, resp.headers.get("last-modified")))
+                route.fulfill(response=resp)
+            else:
+                route.continue_()
+        except Exception:
+            try:
+                route.continue_()
+            except Exception:
+                pass
+
+    page = None
+    try:
+        _context.on("response", on_response)
+        page = _context.new_page()
+        page.route("**/*", route_handler)
+        for i in range(max_items):
+            captured.clear()
+            bodies.clear()
+            page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=12000)
+            except Exception:
+                pass
+            loc = page.locator("a[href^='javascript:']").filter(has_text=CLICK_TEXT_RE)
+            if i >= loc.count():
+                break
+            body, lm = None, None
+            try:
+                with page.expect_download(timeout=8000) as dl:
+                    loc.nth(i).click(timeout=8000, no_wait_after=True)
+                path = dl.value.path()
+                if path:
+                    with open(path, "rb") as f:
+                        body = f.read()
+            except Exception:
+                page.wait_for_timeout(1500)               # no download event: maybe the PDF opened inline
+            if not (body and body[:1024].lstrip().startswith(b"%PDF")):
+                body = None
+                if bodies:
+                    body, lm = bodies[0]
+            if not body:
+                for resp in list(captured):
+                    try:
+                        b = resp.body()
+                        if b[:1024].lstrip().startswith(b"%PDF"):
+                            body, lm = b, resp.headers.get("last-modified")
+                            break
+                    except Exception:
+                        continue
+            if body:
+                found.append((f"{page_url}#button{i + 1}", body, lm))
+            else:
+                log.info(f"  Button {i + 1} did not give a PDF.")
+    except Exception as e:
+        log.warning(f"  Browser click-capture failed: {str(e)[:150]}")
+    finally:
+        try:
+            _context.remove_listener("response", on_response)
+        except Exception:
+            pass
+        try:
+            if page is not None:
+                page.close()
+        except Exception:
+            pass
+    return found
+
+
 def _extract_doc_links(html, base_url):
     """Document links in an HTML page: normal links, iframe/embed/object files, and .pdf addresses
     written inside the page's JavaScript / JSON. Returns (links, soup)."""
@@ -373,6 +476,9 @@ def _extract_doc_links(html, base_url):
     links = []
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
+        mm = re.search(r"href=(https?://.+)$", href, re.I)      # some sites write href="href=https://..."
+        if mm:
+            href = mm.group(1)
         if href.lower().startswith(("javascript:", "mailto:", "#", "tel:")):
             continue
         if any(h in href.lower() for h in LINK_HINTS):
@@ -429,26 +535,34 @@ def find_pdf_links(target_url):
     links, soup = ([], None)
     if html is not None:
         links, soup = _extract_doc_links(html, target_url)
-    if not links:      # blocked (403 ...), or a page that builds its list with JavaScript
+    if not any(STRONG_RE.search(l) for l in links):
+        # blocked (403 ...), a page that builds its list with JavaScript, or only a menu item like "Download"
         got = browser_html(target_url)
         if got:
             blinks, bsoup = _extract_doc_links(got[0], got[1] or target_url)
-            if blinks:
-                log.info(f"  Browser reader found {len(blinks)} document link(s).")
-                links, soup = blinks, bsoup
+            if any(STRONG_RE.search(l) for l in blinks):
+                log.info(f"  Browser reader found {len([l for l in blinks if STRONG_RE.search(l)])} document link(s).")
+                links = list(dict.fromkeys(blinks + links))
+                soup = bsoup
                 _BROWSER_HOSTS.add(host)
             elif soup is None:
                 soup = bsoup
-    if not links:
+            if not any(STRONG_RE.search(l) for l in blinks):
+                for a_ in bsoup.find_all("a", href=True):          # "View PDF" buttons that run JavaScript
+                    if a_["href"].strip().lower().startswith("javascript:") and CLICK_TEXT_RE.search(a_.get_text(" ")):
+                        _CLICK_PAGES.add(target_url)
+                        log.info("  This page has 'View PDF' buttons that run JavaScript; the browser will click them.")
+                        break
+    if not any(STRONG_RE.search(l) for l in links) and target_url not in _CLICK_PAGES:
         sample = []
         if soup is not None:
-            for a in soup.find_all("a", href=True):
-                t = a.get_text(" ", strip=True)
-                if re.search(r"pdf|download|advert|notif|recruit|vacanc|click here", t + " " + a["href"], re.I):
-                    sample.append(f"{t[:40]!r} -> {a['href'][:90]}")
-                if len(sample) >= 5:
+            for a_ in soup.find_all("a", href=True):
+                t = a_.get_text(" ", strip=True)
+                if re.search(r"pdf|download|advert|notif|recruit|vacanc|click here|view", t + " " + a_["href"], re.I):
+                    sample.append(f"{t[:40]!r} -> {a_['href'][:90]}")
+                if len(sample) >= 6:
                     break
-            log.info(f"  Page has {len(soup.find_all('a'))} links, none look like documents. "
+            log.info(f"  Page has {len(soup.find_all('a'))} links, none clearly point at a document. "
                      f"Possibly relevant links: {sample or 'none'}")
         else:
             log.info("  No document links found and the page could not be read.")
@@ -874,12 +988,12 @@ def create_wordpress_post(data, pdf_url, source_page, post_status):
 # ---------------------------------------------------------------------------
 # 9. PDF PIPELINE
 # ---------------------------------------------------------------------------
-def process_pdf(pdf_url, source_page, cutoff, post_status, seen, stats, cap=None):
+def process_pdf(pdf_url, source_page, cutoff, post_status, seen, stats, cap=None, preloaded=None):
     cap = MAX_GEMINI_PER_RUN if cap is None else cap
     url_key = f"url:{pdf_url}"
-    if is_seen(seen, url_key, cutoff, pdf_url):
+    if preloaded is None and is_seen(seen, url_key, cutoff, pdf_url):
         return
-    if not looks_like_job_pdf(pdf_url):
+    if preloaded is None and not looks_like_job_pdf(pdf_url):
         log.info(f"Skipping (name looks like a message / tender / result): {pdf_url}")
         mark_seen(seen, url_key)
         stats["skipped"] += 1
@@ -887,7 +1001,10 @@ def process_pdf(pdf_url, source_page, cutoff, post_status, seen, stats, cap=None
     log.info(f"Checking: {pdf_url}")
 
     try:
-        pdf_bytes, last_modified = download_pdf(pdf_url)
+        if preloaded is not None:
+            pdf_bytes, last_modified = preloaded
+        else:
+            pdf_bytes, last_modified = download_pdf(pdf_url)
     except ValueError as e:                       # permanent: not a PDF / too big
         log.info(f"  Skipped ({e}).")
         mark_seen(seen, url_key)
@@ -1266,7 +1383,7 @@ def main():
                 host = (urlparse(url).hostname or "").lower()
                 if host in _dead_hosts:
                     report[url] = "UNREACHABLE from this server (blocked or timed out)"
-                elif not links:
+                elif not links and url not in _CLICK_PAGES:
                     report[url] = "no document links found (JavaScript page?)"
                 else:
                     report[url] = f"{len(candidates)} new of {len(links)} links"
@@ -1279,6 +1396,14 @@ def main():
                     used += stats["gemini"] - g0
                     if used >= MAX_GEMINI_PER_PORTAL:
                         break
+                if url in _CLICK_PAGES and used < MAX_GEMINI_PER_PORTAL:
+                    for label, body, lm in browser_click_capture(url):
+                        g0 = stats["gemini"]
+                        process_pdf(label, url, cutoff, post_status, seen, stats, preloaded=(body, lm))
+                        used += stats["gemini"] - g0
+                        if used >= MAX_GEMINI_PER_PORTAL:
+                            break
+                    report[url] = "buttons clicked in the browser"
                 if stats["created"] > created_before:
                     report[url] += f" | CREATED {stats['created'] - created_before} post(s)"
         except RunLimit as e:
