@@ -118,6 +118,7 @@ FALLBACK_SETTINGS = {
         "https://mppsc.mp.gov.in/Advertisement",
         "https://psc.uk.gov.in/candidate-corner/recruitment",
         "https://rpsc.rajasthan.gov.in/advertisements",
+        "https://rpsc.rajasthan.gov.in/viewcommon?Slice=RA",
         "https://uppsc.up.nic.in/CandidatePages/Notifications.aspx",
         "https://gpsc.goa.gov.in/advertisements/",
         "https://mpscmanipur.gov.in/whats_new.html",
