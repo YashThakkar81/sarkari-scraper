@@ -68,6 +68,11 @@ jobs:
           $ErrorActionPreference = 'Continue'
           & $env:PYEXE -m pip install -r requirements.txt
           if ($LASTEXITCODE -ne 0) { exit 1 }
+          # Browser reader (Playwright). It uses the Google Chrome installed on this PC. If this step fails,
+          # the scraper still runs; it just cannot open blocked or JavaScript-only pages.
+          & $env:PYEXE -m pip install playwright
+          if ($LASTEXITCODE -ne 0) { Write-Host "WARNING: could not install playwright; continuing without the browser reader." }
+          exit 0
 
       - name: Run Scraper
         env:
@@ -76,6 +81,8 @@ jobs:
           WP_USERNAME: ${{ secrets.WP_USERNAME }}
           WP_APPLICATION_PASSWORD: ${{ secrets.WP_APPLICATION_PASSWORD }}
           MAX_PDFS_PER_PAGE: "2"
+          # MAX_GEMINI_PER_RUN: "20"      # remove the # to check more portals per run (uses more Gemini quota)
+          # USE_BROWSER: "0"             # remove the # to switch the browser reader off
         run: |
           $ErrorActionPreference = 'Continue'
           & $env:PYEXE auto_scraper.py
