@@ -18,6 +18,7 @@ Optional:
     MAX_PDFS_PER_PAGE       (default 5)
     MAX_GEMINI_PER_RUN      (default 12) -> max PDFs sent to Gemini for the normal portal scan
     MAX_GEMINI_PER_PORTAL   (default 2)  -> max PDFs sent to Gemini per portal, so one portal cannot use the whole budget
+    MAX_AGE_DAYS            (optional) -> overrides the age limit from the WordPress panel (e.g. 30)
     MAX_QUERIES_PER_RUN     (default 3) -> visitor questions handled per run
     MAX_QUERY_PDFS_PER_RUN  (default 3) -> PDFs sent to Gemini for visitor questions per run
 """
@@ -245,6 +246,27 @@ def find_pdf_links(target_url):
                 txt = a.get_text(" ", strip=True)
                 if txt and len(txt) > len(_LINK_TEXT.get(full, "")):
                     _LINK_TEXT[full] = txt[:300]
+        # PDF files placed in <iframe>/<embed>/<object>, or written inside the page's JavaScript / JSON
+        # (many "JavaScript" tables keep their PDF addresses in the page source).
+        for tag, attr in (("iframe", "src"), ("embed", "src"), ("object", "data")):
+            for el in soup.find_all(tag):
+                v = (el.get(attr) or "").strip()
+                if ".pdf" in v.lower():
+                    links.append(urljoin(target_url, v))
+        for m in re.finditer(r"""["'(=]\s*([^"'\s<>()]+?\.pdf(?:\?[^"'\s<>()]*)?)""", r.text, flags=re.I):
+            v = m.group(1).replace("\\/", "/")
+            if not v.lower().startswith(("javascript:", "data:")):
+                links.append(urljoin(target_url, v))
+        if not any(l for l in links):
+            sample = []
+            for a in soup.find_all("a", href=True):
+                t = a.get_text(" ", strip=True)
+                if re.search(r"pdf|download|advert|notif|recruit|vacanc|click here", t + " " + a["href"], re.I):
+                    sample.append(f"{t[:40]!r} -> {a['href'][:90]}")
+                if len(sample) >= 5:
+                    break
+            log.info(f"  Page has {len(soup.find_all('a'))} links, none look like documents. "
+                     f"Possibly relevant links: {sample or 'none'}")
     except Exception as e:
         log.error(f"Scraper error on {target_url}: {e}")
         if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
@@ -984,6 +1006,8 @@ def process_user_queries(seen, default_status, default_cutoff):
 def main():
     settings = get_wp_settings()
     max_days = int(settings.get("max_age_days", DEFAULT_MAX_AGE_DAYS) or DEFAULT_MAX_AGE_DAYS)
+    if os.environ.get("MAX_AGE_DAYS", "").strip().isdigit():     # optional override, set in scraper.yml
+        max_days = int(os.environ["MAX_AGE_DAYS"])
     post_status = settings.get("post_status", "draft")
     if post_status not in ("draft", "pending", "publish", "private"):
         post_status = "draft"
