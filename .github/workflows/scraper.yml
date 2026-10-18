@@ -16,13 +16,14 @@ concurrency:
 jobs:
   run-scraper:
     # Runs on your own Windows PC in India (the runner named india-pc).
-    # To go back to GitHub's servers: runs-on: ubuntu-latest, and change every "shell: powershell" to "shell: bash".
+    # To go back to GitHub's servers: runs-on: ubuntu-latest, and change the "shell:" line below to "shell: bash".
     runs-on: [self-hosted, windows]
     timeout-minutes: 45
 
+    # -ExecutionPolicy Bypass: Windows' "scripts are disabled" setting can no longer stop the steps.
     defaults:
       run:
-        shell: powershell
+        shell: 'powershell -NoProfile -ExecutionPolicy Bypass -File {0}'
 
     env:
       PYTHONUTF8: "1"
