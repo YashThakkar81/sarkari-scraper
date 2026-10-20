@@ -802,6 +802,20 @@ def extract_with_gemini(pdf_bytes):
             part = uploaded
 
         raw = call_gemini([part, prompt], json_mode=True)
+        data = None
+        for attempt in (1, 2):                       # Gemini sometimes returns JSON with a stray quote or comma: ask once more
+            cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+            cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", cleaned)   # control characters break JSON
+            try:
+                data = json.loads(cleaned)
+                break
+            except ValueError as e:
+                if attempt == 2:
+                    raise
+                log.warning(f"  Gemini JSON was not valid ({str(e)[:80]}); asking again once.")
+                raw = call_gemini([part, prompt + "\nIMPORTANT: output strictly valid JSON. Escape every double quote "
+                                                  "inside text values as \\\" and do not use line breaks inside strings."],
+                                  json_mode=True)
     finally:
         if uploaded is not None:
             try:
@@ -809,8 +823,6 @@ def extract_with_gemini(pdf_bytes):
             except Exception:
                 pass
 
-    raw = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
-    data = json.loads(raw)
     if isinstance(data, list):
         data = data[0] if data else {}
     if not isinstance(data, dict):
