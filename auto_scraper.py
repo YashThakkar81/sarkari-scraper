@@ -89,6 +89,8 @@ MODEL_CANDIDATES = [m for m in [
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s",
                     datefmt="%H:%M:%S")
 log = logging.getLogger("sarkari-bot")
+logging.getLogger("google_genai").setLevel(logging.ERROR)    # "AFC is enabled ..." warning on every call
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -476,9 +478,9 @@ def _extract_doc_links(html, base_url):
     links = []
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
-        mm = re.search(r"href=(https?://.+)$", href, re.I)      # some sites write href="href=https://..."
+        mm = re.search(r"href\s*=\s*(https?:/+.+)$", href, re.I)   # some sites write href="href=https:/host/file.pdf"
         if mm:
-            href = mm.group(1)
+            href = re.sub(r"^(https?):/+", r"\1://", mm.group(1).strip(), flags=re.I)
         if href.lower().startswith(("javascript:", "mailto:", "#", "tel:")):
             continue
         if any(h in href.lower() for h in LINK_HINTS):
@@ -1052,7 +1054,18 @@ def process_pdf(pdf_url, source_page, cutoff, post_status, seen, stats, cap=None
             mark_seen(seen, url_key)
             stats["skipped"] += 1
             return
-        log.warning(f"  Download failed: {e}")    # temporary problem: retry next run
+        fkey = f"fail:{pdf_url}"                  # temporary problem: retry next run, but give up after 3 runs
+        try:
+            tries = int(seen.get(fkey, "0")) + 1
+        except (TypeError, ValueError):
+            tries = 1
+        if tries >= 3:
+            log.warning(f"  Download failed 3 times ({e}); giving up on this link.")
+            mark_seen(seen, url_key)
+        else:
+            log.warning(f"  Download failed (try {tries}/3): {e}")
+            seen[fkey] = str(tries)
+            save_seen(seen)
         stats["errors"] += 1
         return
 
@@ -1261,14 +1274,20 @@ JOB_WORDS_RE = re.compile(r"recruit|advert|advt|notif|vacanc|apply|application|b
                           r"tradesm|officer|engineer|teacher|clerk|assistant|operator|driver|nurse|"
                           r"inspector|agniveer|agnipath|result_?of_?selection", re.I)
 NOT_JOB_RE = re.compile(r"message|\bmsg\b|speech|tender|quotation|result|admit|hall_?ticket|syllabus|answer|"
-                        r"\bkey\b|circular|policy|annual|report|rti|newsletter|calendar|brochure|"
-                        r"magazine|budget|holiday|order|minutes|oath|pledge|award|gazette|manual", re.I)
+                        r"\bkey\b|\bans\b|circular|policy|annual|report|rti|newsletter|calendar|brochure|"
+                        r"magazine|budget|holiday|order|minutes|oath|pledge|award|gazette|manual|"
+                        r"programme|schedule|shortlist|interview list|merit list|cut ?off|corrigendum|"
+                        r"extension|\bprog\b|selected|waiting list|provisional|marks", re.I)
+HARD_NOT_RE = re.compile(r"result|admit|hall_?ticket|answer|\bkey\b|\bans\b|syllabus|shortlist|merit list|cut ?off|marks|tender|quotation", re.I)
+STRONG_JOB_RE = re.compile(r"recruit|advert|advt|vacanc|bharti|walk ?in|invit", re.I)
 
 
 def looks_like_job_pdf(url):
-    """Cheap filename check so visitor-question runs do not spend Gemini calls on messages, tenders, results..."""
+    """Cheap filename check so runs do not spend Gemini calls on messages, answer keys, programmes, results...
+    A clear recruitment word (recruitment, advertisement, advt, vacancy...) always wins; otherwise a
+    'not a job' word rejects the file; anything else is still checked (Gemini decides)."""
     name = re.sub(r"[%_\-\.+/]+", " ", urlparse(url).path.lower()) + " " + _LINK_TEXT.get(url, "").lower()
-    if JOB_WORDS_RE.search(name):
+    if STRONG_JOB_RE.search(name) and not HARD_NOT_RE.search(name):
         return True
     return not NOT_JOB_RE.search(name)
 
