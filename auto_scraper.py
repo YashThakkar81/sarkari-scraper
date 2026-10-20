@@ -760,7 +760,7 @@ JSON schema:
   "notification_issue_date": "YYYY-MM-DD or null",
   "application_start_date": "YYYY-MM-DD or null",
   "last_date_to_apply": "YYYY-MM-DD or null",
-  "total_vacancies": "Total positions or 'Not Specified'",
+  "total_vacancies": "Total number of posts as digits only, e.g. 16 (sum all posts if the PDF lists them separately), or 'Not Specified'",
   "eligibility_summary": "Brief eligibility requirements",
   "short_description": "2 sentence plain-text summary (max 300 characters)",
   "advt_number": "Advertisement/Notification number or 'N/A'",
@@ -775,7 +775,7 @@ salary_amount: lowest monthly pay as a plain integer (e.g. 35400); 0 if unspecif
 formatted_post_content must be clean HTML fragment (no <html>, <body>, <script>, markdown or code fences, no links) containing:
 <h2> title, short overview paragraph, then <h2>/<h3> sections with <table> for:
 Important Dates (notification date, start date, last date, exam date if given),
-Vacancy Details (post-wise vacancies and category split if given),
+Vacancy Details (post-wise vacancies and category split if given, ending with a final row "Total Posts" that shows the total),
 Eligibility (education, age limit with relaxation, experience),
 Application Fee, Pay Scale, Selection Process, and How to Apply (numbered steps).
 Omit a section only if the PDF has nothing about it.
@@ -854,6 +854,12 @@ def clean_value(v, default=""):
         return default
     v = str(v).strip()
     return v if v and v.lower() not in ("null", "none") else default
+
+
+def clean_vacancies(v):
+    """'16', '16 posts', '1,250' -> '16' / '1250'. Anything with several numbers is left empty."""
+    nums = re.findall(r"\d+", str(v or "").replace(",", ""))
+    return nums[0] if len(nums) == 1 and 0 < int(nums[0]) <= 500000 else ""
 
 
 def sanitize_html(html):
@@ -987,6 +993,24 @@ def create_wordpress_post(data, pdf_url, source_page, post_status):
         "excerpt": clean_value(data.get("short_description")),
         "status": post_status,
     }
+
+    # Quick-info fields of the Sarkari News Template plugin (Total posts, dates, organisation).
+    # Sent only when Gemini really found them; the plugin fills any missing ones from the article text.
+    meta = {}
+    vac = clean_vacancies(data.get("total_vacancies"))
+    if vac:
+        meta["sjg_vacancies"] = vac
+    for key, field in (("sjg_start_date", "application_start_date"),
+                       ("sjg_last_date", "last_date_to_apply")):
+        d = parse_date(data.get(field))
+        if d:
+            meta[key] = d.strftime("%Y-%m-%d")
+    org = clean_value(data.get("hiring_organization"))
+    if org:
+        meta["sjg_org"] = org
+    if meta:
+        payload["meta"] = meta
+
     r = requests.post(f"{WP_SITE_URL}/wp-json/wp/v2/posts", auth=WP_AUTH, json=payload, timeout=30)
     if r.status_code in (200, 201):
         log.info(f"CREATED ({post_status}): {title}  ->  {r.json().get('link', '')}")
