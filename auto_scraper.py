@@ -38,7 +38,7 @@ import hashlib
 import logging
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, unquote
 
 import requests
 import urllib3
@@ -89,6 +89,8 @@ MODEL_CANDIDATES = [m for m in [
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s",
                     datefmt="%H:%M:%S")
 log = logging.getLogger("sarkari-bot")
+logging.getLogger("google_genai").setLevel(logging.ERROR)    # "AFC is enabled ..." warning on every call
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -118,7 +120,7 @@ FALLBACK_SETTINGS = {
         "https://appsc.gov.in/Index/sub_page/doc2195/Advertisements",
         "https://mppsc.mp.gov.in/Advertisement",
         "https://psc.uk.gov.in/candidate-corner/recruitment",
-        "https://rpsc.rajasthan.gov.in/advertisements",
+        "https://rpsc.rajasthan.gov.in/viewcommon?Slice=RA",
         "https://uppsc.up.nic.in/CandidatePages/Notifications.aspx",
         "https://gpsc.goa.gov.in/advertisements/",
         "https://mpscmanipur.gov.in/whats_new.html",
@@ -476,9 +478,9 @@ def _extract_doc_links(html, base_url):
     links = []
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
-        mm = re.search(r"href=(https?://.+)$", href, re.I)      # some sites write href="href=https://..."
+        mm = re.search(r"href\s*=\s*(https?:/+.+)$", href, re.I)   # some sites write href="href=https:/host/file.pdf"
         if mm:
-            href = mm.group(1)
+            href = re.sub(r"^(https?):/+", r"\1://", mm.group(1).strip(), flags=re.I)
         if href.lower().startswith(("javascript:", "mailto:", "#", "tel:")):
             continue
         if any(h in href.lower() for h in LINK_HINTS):
@@ -494,6 +496,8 @@ def _extract_doc_links(html, base_url):
                 links.append(urljoin(base_url, v))
     for m in re.finditer(r"""["'(=]\s*([^"'\s<>()]+?\.pdf(?:\?[^"'\s<>()]*)?)""", html, flags=re.I):
         v = m.group(1).replace("\\/", "/")
+        v = re.sub(r"^href\s*=\s*", "", v, flags=re.I)             # href="href=https:/host/file.pdf" quirk
+        v = re.sub(r"^(https?):/+", r"\1://", v, flags=re.I)
         if not v.lower().startswith(("javascript:", "data:")):
             links.append(urljoin(base_url, v))
     return list(dict.fromkeys(links)), soup
@@ -760,7 +764,7 @@ JSON schema:
   "notification_issue_date": "YYYY-MM-DD or null",
   "application_start_date": "YYYY-MM-DD or null",
   "last_date_to_apply": "YYYY-MM-DD or null",
-  "total_vacancies": "Total positions or 'Not Specified'",
+  "total_vacancies": "Total number of posts as digits only, e.g. 16 (sum all posts if the PDF lists them separately), or 'Not Specified'",
   "eligibility_summary": "Brief eligibility requirements",
   "short_description": "2 sentence plain-text summary (max 300 characters)",
   "advt_number": "Advertisement/Notification number or 'N/A'",
@@ -775,7 +779,7 @@ salary_amount: lowest monthly pay as a plain integer (e.g. 35400); 0 if unspecif
 formatted_post_content must be clean HTML fragment (no <html>, <body>, <script>, markdown or code fences, no links) containing:
 <h2> title, short overview paragraph, then <h2>/<h3> sections with <table> for:
 Important Dates (notification date, start date, last date, exam date if given),
-Vacancy Details (post-wise vacancies and category split if given),
+Vacancy Details (post-wise vacancies and category split if given, ending with a final row "Total Posts" that shows the total),
 Eligibility (education, age limit with relaxation, experience),
 Application Fee, Pay Scale, Selection Process, and How to Apply (numbered steps).
 Omit a section only if the PDF has nothing about it.
@@ -854,6 +858,12 @@ def clean_value(v, default=""):
         return default
     v = str(v).strip()
     return v if v and v.lower() not in ("null", "none") else default
+
+
+def clean_vacancies(v):
+    """'16', '16 posts', '1,250' -> '16' / '1250'. Anything with several numbers is left empty."""
+    nums = re.findall(r"\d+", str(v or "").replace(",", ""))
+    return nums[0] if len(nums) == 1 and 0 < int(nums[0]) <= 500000 else ""
 
 
 def sanitize_html(html):
@@ -987,6 +997,24 @@ def create_wordpress_post(data, pdf_url, source_page, post_status):
         "excerpt": clean_value(data.get("short_description")),
         "status": post_status,
     }
+
+    # Quick-info fields of the Sarkari News Template plugin (Total posts, dates, organisation).
+    # Sent only when Gemini really found them; the plugin fills any missing ones from the article text.
+    meta = {}
+    vac = clean_vacancies(data.get("total_vacancies"))
+    if vac:
+        meta["sjg_vacancies"] = vac
+    for key, field in (("sjg_start_date", "application_start_date"),
+                       ("sjg_last_date", "last_date_to_apply")):
+        d = parse_date(data.get(field))
+        if d:
+            meta[key] = d.strftime("%Y-%m-%d")
+    org = clean_value(data.get("hiring_organization"))
+    if org:
+        meta["sjg_org"] = org
+    if meta:
+        payload["meta"] = meta
+
     r = requests.post(f"{WP_SITE_URL}/wp-json/wp/v2/posts", auth=WP_AUTH, json=payload, timeout=30)
     if r.status_code in (200, 201):
         log.info(f"CREATED ({post_status}): {title}  ->  {r.json().get('link', '')}")
@@ -1010,6 +1038,13 @@ def process_pdf(pdf_url, source_page, cutoff, post_status, seen, stats, cap=None
         mark_seen(seen, url_key)
         stats["skipped"] += 1
         return
+    if preloaded is None:
+        nd = date_in_name(pdf_url)
+        if nd and nd < cutoff - timedelta(days=14):
+            log.info(f"Skipping (the file name says {nd:%Y-%m-%d}, older than the age limit): {pdf_url}")
+            mark_old(seen, f"{nd + timedelta(days=14):%Y-%m-%d}", url_key)
+            stats["skipped"] += 1
+            return
     log.info(f"Checking: {pdf_url}")
 
     try:
@@ -1028,7 +1063,18 @@ def process_pdf(pdf_url, source_page, cutoff, post_status, seen, stats, cap=None
             mark_seen(seen, url_key)
             stats["skipped"] += 1
             return
-        log.warning(f"  Download failed: {e}")    # temporary problem: retry next run
+        fkey = f"fail:{pdf_url}"                  # temporary problem: retry next run, but give up after 3 runs
+        try:
+            tries = int(seen.get(fkey, "0")) + 1
+        except (TypeError, ValueError):
+            tries = 1
+        if tries >= 3:
+            log.warning(f"  Download failed 3 times ({e}); giving up on this link.")
+            mark_seen(seen, url_key)
+        else:
+            log.warning(f"  Download failed (try {tries}/3): {e}")
+            seen[fkey] = str(tries)
+            save_seen(seen)
         stats["errors"] += 1
         return
 
@@ -1237,14 +1283,47 @@ JOB_WORDS_RE = re.compile(r"recruit|advert|advt|notif|vacanc|apply|application|b
                           r"tradesm|officer|engineer|teacher|clerk|assistant|operator|driver|nurse|"
                           r"inspector|agniveer|agnipath|result_?of_?selection", re.I)
 NOT_JOB_RE = re.compile(r"message|\bmsg\b|speech|tender|quotation|result|admit|hall_?ticket|syllabus|answer|"
-                        r"\bkey\b|circular|policy|annual|report|rti|newsletter|calendar|brochure|"
-                        r"magazine|budget|holiday|order|minutes|oath|pledge|award|gazette|manual", re.I)
+                        r"\bkey\b|\bans\b|circular|policy|annual|report|rti|newsletter|calendar|brochure|"
+                        r"magazine|budget|holiday|order|minutes|oath|pledge|award|gazette|manual|"
+                        r"programme|schedule|shortlist|interview list|merit list|cut ?off|corrigendum|"
+                        r"extension|\bprog\b|selected|waiting list|provisional|marks", re.I)
+HARD_NOT_RE = re.compile(r"result|admit|hall_?ticket|answer|\bkey\b|\bans\b|syllabus|shortlist|merit list|cut ?off|marks|tender|quotation|programme|\bprog\b|schedule|recom|viva|time ?table|provisional|waiting list", re.I)
+STRONG_JOB_RE = re.compile(r"recruit|advert|advt|vacanc|bharti|walk ?in|invit", re.I)
+
+
+_NAME_DATE_RES = (
+    (re.compile(r"(?<!\d)(\d{1,2})[\s._/\-](\d{1,2})[\s._/\-](20\d{2})(?!\d)"), "dmy"),   # 31 12 2025, 31-12-2025
+    (re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)"), "ymd"),                          # 20260901
+)
+
+
+def date_in_name(url):
+    """Newest full date (dd mm yyyy or yyyymmdd) written in the file name or the link text, else None.
+    Used to skip old notices without downloading them or asking Gemini."""
+    name = unquote(urlparse(url).path) + " " + _LINK_TEXT.get(url, "")
+    best = None
+    for rx, order in _NAME_DATE_RES:
+        for m in rx.finditer(name):
+            a, b, c = (int(x) for x in m.groups())
+            y, mo, d = (c, b, a) if order == "dmy" else (a, b, c)
+            try:
+                dt = datetime(y, mo, d)
+            except ValueError:
+                continue
+            if best is None or dt > best:
+                best = dt
+    return best
 
 
 def looks_like_job_pdf(url):
-    """Cheap filename check so visitor-question runs do not spend Gemini calls on messages, tenders, results..."""
+    """Cheap filename check so runs do not spend Gemini calls on messages, answer keys, programmes, results...
+    Words that clearly mean 'not a vacancy notice' (result, answer key, programme, recommended list...) reject the file;
+    otherwise a recruitment word (recruitment, advertisement, advt, vacancy...) accepts it; otherwise a weaker
+    'not a job' word rejects it; anything else is still checked (Gemini decides)."""
     name = re.sub(r"[%_\-\.+/]+", " ", urlparse(url).path.lower()) + " " + _LINK_TEXT.get(url, "").lower()
-    if JOB_WORDS_RE.search(name):
+    if HARD_NOT_RE.search(name):
+        return False
+    if STRONG_JOB_RE.search(name):
         return True
     return not NOT_JOB_RE.search(name)
 
@@ -1444,5 +1523,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
