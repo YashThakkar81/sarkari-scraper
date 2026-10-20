@@ -120,7 +120,7 @@ FALLBACK_SETTINGS = {
         "https://appsc.gov.in/Index/sub_page/doc2195/Advertisements",
         "https://mppsc.mp.gov.in/Advertisement",
         "https://psc.uk.gov.in/candidate-corner/recruitment",
-        "https://rpsc.rajasthan.gov.in/advertisements",
+        "https://rpsc.rajasthan.gov.in/viewcommon?Slice=RA",
         "https://uppsc.up.nic.in/CandidatePages/Notifications.aspx",
         "https://gpsc.goa.gov.in/advertisements/",
         "https://mpscmanipur.gov.in/whats_new.html",
@@ -496,6 +496,8 @@ def _extract_doc_links(html, base_url):
                 links.append(urljoin(base_url, v))
     for m in re.finditer(r"""["'(=]\s*([^"'\s<>()]+?\.pdf(?:\?[^"'\s<>()]*)?)""", html, flags=re.I):
         v = m.group(1).replace("\\/", "/")
+        v = re.sub(r"^href\s*=\s*", "", v, flags=re.I)             # href="href=https:/host/file.pdf" quirk
+        v = re.sub(r"^(https?):/+", r"\1://", v, flags=re.I)
         if not v.lower().startswith(("javascript:", "data:")):
             links.append(urljoin(base_url, v))
     return list(dict.fromkeys(links)), soup
@@ -1278,16 +1280,19 @@ NOT_JOB_RE = re.compile(r"message|\bmsg\b|speech|tender|quotation|result|admit|h
                         r"magazine|budget|holiday|order|minutes|oath|pledge|award|gazette|manual|"
                         r"programme|schedule|shortlist|interview list|merit list|cut ?off|corrigendum|"
                         r"extension|\bprog\b|selected|waiting list|provisional|marks", re.I)
-HARD_NOT_RE = re.compile(r"result|admit|hall_?ticket|answer|\bkey\b|\bans\b|syllabus|shortlist|merit list|cut ?off|marks|tender|quotation", re.I)
+HARD_NOT_RE = re.compile(r"result|admit|hall_?ticket|answer|\bkey\b|\bans\b|syllabus|shortlist|merit list|cut ?off|marks|tender|quotation|programme|\bprog\b|schedule|recom|viva|time ?table|provisional|waiting list", re.I)
 STRONG_JOB_RE = re.compile(r"recruit|advert|advt|vacanc|bharti|walk ?in|invit", re.I)
 
 
 def looks_like_job_pdf(url):
     """Cheap filename check so runs do not spend Gemini calls on messages, answer keys, programmes, results...
-    A clear recruitment word (recruitment, advertisement, advt, vacancy...) always wins; otherwise a
-    'not a job' word rejects the file; anything else is still checked (Gemini decides)."""
+    Words that clearly mean 'not a vacancy notice' (result, answer key, programme, recommended list...) reject the file;
+    otherwise a recruitment word (recruitment, advertisement, advt, vacancy...) accepts it; otherwise a weaker
+    'not a job' word rejects it; anything else is still checked (Gemini decides)."""
     name = re.sub(r"[%_\-\.+/]+", " ", urlparse(url).path.lower()) + " " + _LINK_TEXT.get(url, "").lower()
-    if STRONG_JOB_RE.search(name) and not HARD_NOT_RE.search(name):
+    if HARD_NOT_RE.search(name):
+        return False
+    if STRONG_JOB_RE.search(name):
         return True
     return not NOT_JOB_RE.search(name)
 
