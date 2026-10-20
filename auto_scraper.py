@@ -38,7 +38,7 @@ import hashlib
 import logging
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, unquote
 
 import requests
 import urllib3
@@ -120,7 +120,7 @@ FALLBACK_SETTINGS = {
         "https://appsc.gov.in/Index/sub_page/doc2195/Advertisements",
         "https://mppsc.mp.gov.in/Advertisement",
         "https://psc.uk.gov.in/candidate-corner/recruitment",
-        "https://rpsc.rajasthan.gov.in/viewcommon?Slice=RA",
+        "https://rpsc.rajasthan.gov.in/advertisements",
         "https://uppsc.up.nic.in/CandidatePages/Notifications.aspx",
         "https://gpsc.goa.gov.in/advertisements/",
         "https://mpscmanipur.gov.in/whats_new.html",
@@ -1038,6 +1038,13 @@ def process_pdf(pdf_url, source_page, cutoff, post_status, seen, stats, cap=None
         mark_seen(seen, url_key)
         stats["skipped"] += 1
         return
+    if preloaded is None:
+        nd = date_in_name(pdf_url)
+        if nd and nd < cutoff - timedelta(days=14):
+            log.info(f"Skipping (the file name says {nd:%Y-%m-%d}, older than the age limit): {pdf_url}")
+            mark_old(seen, f"{nd + timedelta(days=14):%Y-%m-%d}", url_key)
+            stats["skipped"] += 1
+            return
     log.info(f"Checking: {pdf_url}")
 
     try:
@@ -1282,6 +1289,30 @@ NOT_JOB_RE = re.compile(r"message|\bmsg\b|speech|tender|quotation|result|admit|h
                         r"extension|\bprog\b|selected|waiting list|provisional|marks", re.I)
 HARD_NOT_RE = re.compile(r"result|admit|hall_?ticket|answer|\bkey\b|\bans\b|syllabus|shortlist|merit list|cut ?off|marks|tender|quotation|programme|\bprog\b|schedule|recom|viva|time ?table|provisional|waiting list", re.I)
 STRONG_JOB_RE = re.compile(r"recruit|advert|advt|vacanc|bharti|walk ?in|invit", re.I)
+
+
+_NAME_DATE_RES = (
+    (re.compile(r"(?<!\d)(\d{1,2})[\s._/\-](\d{1,2})[\s._/\-](20\d{2})(?!\d)"), "dmy"),   # 31 12 2025, 31-12-2025
+    (re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)"), "ymd"),                          # 20260901
+)
+
+
+def date_in_name(url):
+    """Newest full date (dd mm yyyy or yyyymmdd) written in the file name or the link text, else None.
+    Used to skip old notices without downloading them or asking Gemini."""
+    name = unquote(urlparse(url).path) + " " + _LINK_TEXT.get(url, "")
+    best = None
+    for rx, order in _NAME_DATE_RES:
+        for m in rx.finditer(name):
+            a, b, c = (int(x) for x in m.groups())
+            y, mo, d = (c, b, a) if order == "dmy" else (a, b, c)
+            try:
+                dt = datetime(y, mo, d)
+            except ValueError:
+                continue
+            if best is None or dt > best:
+                best = dt
+    return best
 
 
 def looks_like_job_pdf(url):
