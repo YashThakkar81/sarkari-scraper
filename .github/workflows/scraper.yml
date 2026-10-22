@@ -1,8 +1,7 @@
 name: Scheduled Job Scraper
 
+# Manual only: no automatic timing. Start it from the Actions tab -> "Run workflow".
 on:
-  schedule:
-    - cron: '0 */3 * * *'
   workflow_dispatch:
 
 permissions:
