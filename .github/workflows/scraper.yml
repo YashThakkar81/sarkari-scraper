@@ -1,8 +1,7 @@
 name: Scheduled Job Scraper
 
+# Manual only: no automatic timing. Start it from the Actions tab -> "Run workflow".
 on:
-  schedule:
-    - cron: '0 */3 * * *'
   workflow_dispatch:
 
 permissions:
@@ -82,7 +81,7 @@ jobs:
           WP_APPLICATION_PASSWORD: ${{ secrets.WP_APPLICATION_PASSWORD }}
           MAX_PDFS_PER_PAGE: "2"
           # FORCE_RECHECK: "mppsc.mp.gov.in"   # optional: check a website's files again even if seen before
-          # MAX_GEMINI_PER_RUN: "20"      # remove the # to check more portals per run (uses more Gemini quota)
+          MAX_GEMINI_PER_RUN: "2"         # cap on Gemini checks per run (default was 12). Raise it to check more portals per run (uses more Gemini quota)
           # USE_BROWSER: "0"             # remove the # to switch the browser reader off
         run: |
           $ErrorActionPreference = 'Continue'
