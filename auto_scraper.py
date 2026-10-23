@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-Sarkari Jobs Guide - Auto Notification Drafter  (v2: + visitor-question queue)
+Sarkari Jobs Guide - Auto Notification Drafter  (v3: + triage step, newest-first)
 ------------------------------------------------------------------------------
 1. Scans your list of government recruitment pages -> finds PDFs -> Gemini extracts details ->
    creates a WordPress post (draft by default) with JobPosting JSON-LD.
-2. NEW: reads the "Users' Queries" queue from your website (job questions your site could not answer),
+2. Reads the "Users' Queries" queue from your website (job questions your site could not answer),
    asks Gemini + Google Search for the official recruitment page, and makes a post from it,
    even when that website is NOT in the list below.
+
+NEW in v3:
+   - triage(): the free checks (file name looks like a result/tender, date in file name / link text /
+     SBI "?t=" timestamp is too old) now run on ALL links of a portal, not only on the first few.
+     The links that survive are sorted newest-first, so new advertisements are reached in the same run.
+   - date_in_name() understands 25032026 (ddmmyyyy) and SBI's ?t=<milliseconds> timestamp.
+   - DEBUG_LINKS=1 prints the first links of each portal with their "seen" status (for troubleshooting).
 
 Setup:
     pip install requests beautifulsoup4 google-genai urllib3
@@ -22,6 +29,7 @@ Optional:
     USE_BROWSER             (default 1)  -> 0 switches the real-browser reader (Playwright) off
     MAX_BROWSER_PAGES       (default 20) -> browser page loads per run
     FORCE_RECHECK           (optional) -> parts of web addresses to check again even if seen before, e.g. mppsc.mp.gov.in
+    DEBUG_LINKS             (optional) -> 1 prints the first links of each portal and whether they were seen before
     MAX_QUERIES_PER_RUN     (default 3) -> visitor questions handled per run
     MAX_QUERY_PDFS_PER_RUN  (default 3) -> PDFs sent to Gemini for visitor questions per run
 """
@@ -68,6 +76,7 @@ MAX_GEMINI_PER_RUN = int(os.environ.get("MAX_GEMINI_PER_RUN", "12"))
 MAX_GEMINI_PER_PORTAL = int(os.environ.get("MAX_GEMINI_PER_PORTAL", "2"))
 MAX_QUERIES_PER_RUN = int(os.environ.get("MAX_QUERIES_PER_RUN", "3"))
 MAX_QUERY_PDFS_PER_RUN = int(os.environ.get("MAX_QUERY_PDFS_PER_RUN", "3"))
+DEBUG_LINKS = os.environ.get("DEBUG_LINKS", "").strip().lower() in ("1", "true", "yes", "on")
 INLINE_PDF_LIMIT = 18 * 1024 * 1024      # above this, use the Gemini Files API
 MAX_PDF_SIZE = 45 * 1024 * 1024          # skip anything bigger
 DEFAULT_MAX_AGE_DAYS = 7
@@ -1243,14 +1252,22 @@ STRONG_JOB_RE = re.compile(r"recruit|advert|advt|vacanc|bharti|walk ?in|invit", 
 _NAME_DATE_RES = (
     (re.compile(r"(?<!\d)(\d{1,2})[\s._/\-](\d{1,2})[\s._/\-](20\d{2})(?!\d)"), "dmy"),   # 31 12 2025, 31-12-2025
     (re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)"), "ymd"),                          # 20260901
+    (re.compile(r"(?<!\d)(\d{2})(\d{2})(20\d{2})(?!\d)"), "dmy"),                         # 25032026 (SBI style)
 )
 
 
 def date_in_name(url):
-    """Newest full date (dd mm yyyy or yyyymmdd) written in the file name or the link text, else None.
+    """Newest full date written in the file name or the link text (dd mm yyyy, yyyymmdd, ddmmyyyy),
+    or the SBI-style '?t=<milliseconds>' timestamp, else None.
     Used to skip old notices without downloading them or asking Gemini."""
     name = unquote(urlparse(url).path) + " " + _LINK_TEXT.get(url, "")
     best = None
+    m = re.search(r"[?&]t=(\d{13})(?!\d)", url)       # SBI: ...pdf/<id>?t=1763288812403 (the file's last-change time)
+    if m:
+        try:
+            best = datetime.fromtimestamp(int(m.group(1)) / 1000)
+        except (ValueError, OSError, OverflowError):
+            best = None
     for rx, order in _NAME_DATE_RES:
         for m in rx.finditer(name):
             a, b, c = (int(x) for x in m.groups())
@@ -1275,6 +1292,51 @@ def looks_like_job_pdf(url):
     if STRONG_JOB_RE.search(name):
         return True
     return not NOT_JOB_RE.search(name)
+
+
+def triage(candidates, cutoff, seen, stats):
+    """Free checks on ALL new links of a portal (no download, no Gemini):
+       - the name / link text looks like a message, tender, result ...  -> marked seen, dropped
+       - a date in the name / link text / ?t= timestamp is older than the age limit -> marked old, dropped
+    The survivors are sorted so the most promising ones are opened first:
+       group 0 = has a recent date (newest first), group 1 = no date but mentions the current / next year,
+       group 2 = no date but has a recruitment word, group 3 = everything else (page order kept)."""
+    now = datetime.now().isoformat(timespec="seconds")
+    this_year = datetime.now().year
+    years = (str(this_year), str(this_year + 1))
+    keep = []
+    dropped_name = dropped_old = 0
+    for p in candidates:
+        key = f"url:{p}"
+        if not looks_like_job_pdf(p):
+            seen[key] = now
+            dropped_name += 1
+            continue
+        nd = date_in_name(p)
+        if nd and nd < cutoff - timedelta(days=14):
+            seen[key] = f"old:{nd + timedelta(days=14):%Y-%m-%d}"
+            dropped_old += 1
+            continue
+        keep.append((p, nd))
+    stats["skipped"] += dropped_name + dropped_old
+    if dropped_name or dropped_old:
+        save_seen(seen)
+    log.info(f"  Triage: {len(candidates)} new link(s) -> dropped {dropped_name} (not a job file name), "
+             f"{dropped_old} (too old by date) -> {len(keep)} left to open, newest first.")
+
+    def score(item):
+        p, nd = item
+        text = unquote(urlparse(p).path) + " " + _LINK_TEXT.get(p, "")
+        if nd:
+            return (0, -nd.timestamp())
+        if any(y in text for y in years):
+            return (1, 0)
+        if STRONG_JOB_RE.search(text):
+            return (2, 0)
+        return (3, 0)
+
+    keep.sort(key=score)          # stable sort: ties keep the page order
+    return [p for p, _ in keep]
 
 
 def find_pdf_links_deep(page_url, max_sub=3):
@@ -1428,6 +1490,14 @@ def main():
                 else:
                     report[url] = f"{len(candidates)} new of {len(links)} links"
                 log.info(f"  {len(candidates)} new document link(s) on this page.")
+                if DEBUG_LINKS:
+                    for p in links[:8]:
+                        log.info(f"   DEBUG {p[-90:]}  seen={seen.get('url:' + p)!r}  "
+                                 f"text={_LINK_TEXT.get(p, '')[:50]!r}  date={date_in_name(p)}")
+
+                # NEW: free checks on every new link, newest first, before any download
+                candidates = triage(candidates, cutoff, seen, stats)
+
                 used = 0
                 created_before = stats["created"]
                 for pdf_url in candidates[:MAX_PDFS_PER_PAGE * 3]:
