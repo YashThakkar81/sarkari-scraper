@@ -1,7 +1,8 @@
 name: Scheduled Job Scraper
 
-# Manual only: no automatic timing. Start it from the Actions tab -> "Run workflow".
 on:
+  schedule:
+    - cron: '0 */3 * * *'
   workflow_dispatch:
 
 permissions:
@@ -79,19 +80,9 @@ jobs:
           WP_URL: ${{ secrets.WP_URL }}
           WP_USERNAME: ${{ secrets.WP_USERNAME }}
           WP_APPLICATION_PASSWORD: ${{ secrets.WP_APPLICATION_PASSWORD }}
-          # Links that need a download (after the free triage step) per portal = MAX_PDFS_PER_PAGE x 3 = 12
-          MAX_PDFS_PER_PAGE: "4"
-          # Gemini checks: at most 2 per portal, at most 6 per run (3 portals x 2). 2 per run was too low.
-          MAX_GEMINI_PER_RUN: "6"
-          MAX_GEMINI_PER_PORTAL: "2"
-          # CATCH-UP RUN: 45 days so HPSC Advt 25 of 2026 (18.09.2026, still open) is accepted.
-          # After this run succeeds, delete this line (or set it to "14") to go back to the normal age limit.
-          MAX_AGE_DAYS: "45"
-          # TROUBLESHOOTING (optional): prints the first links of each portal and whether they were seen before.
-          # Remove the # on the next line for one run, then put it back.
-          # DEBUG_LINKS: "1"
-          # To check one website's files again even if seen before, remove the # (use for ONE run only):
-          # FORCE_RECHECK: "andamannicobar.gov.in"
+          MAX_PDFS_PER_PAGE: "2"
+          # FORCE_RECHECK: "mppsc.mp.gov.in"   # optional: check a website's files again even if seen before
+          # MAX_GEMINI_PER_RUN: "20"      # remove the # to check more portals per run (uses more Gemini quota)
           # USE_BROWSER: "0"             # remove the # to switch the browser reader off
         run: |
           $ErrorActionPreference = 'Continue'
