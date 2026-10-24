@@ -1,9 +1,18 @@
 name: Scheduled Job Scraper
 
+# MANUAL ONLY: there is no "schedule:" any more, so nothing runs automatically.
+# Start it from the Actions tab -> "Scheduled Job Scraper" -> "Run workflow".
 on:
-  schedule:
-    - cron: '0 */3 * * *'
   workflow_dispatch:
+    inputs:
+      max_age_days:
+        description: "Only notices from the last N days (blank = plugin setting)"
+        required: false
+        default: ""
+      force_recheck:
+        description: "Re-check sites even if seen before, e.g. sbi.bank.in,andamannicobar.gov.in"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -18,7 +27,7 @@ jobs:
     # Runs on your own Windows PC in India (the runner named india-pc).
     # To go back to GitHub's servers: runs-on: ubuntu-latest, and change the "shell:" line below to "shell: bash".
     runs-on: [self-hosted, windows]
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     # -ExecutionPolicy Bypass: Windows' "scripts are disabled" setting can no longer stop the steps.
     defaults:
@@ -80,9 +89,15 @@ jobs:
           WP_URL: ${{ secrets.WP_URL }}
           WP_USERNAME: ${{ secrets.WP_USERNAME }}
           WP_APPLICATION_PASSWORD: ${{ secrets.WP_APPLICATION_PASSWORD }}
-          MAX_PDFS_PER_PAGE: "2"
-          # FORCE_RECHECK: "mppsc.mp.gov.in"   # optional: check a website's files again even if seen before
-          # MAX_GEMINI_PER_RUN: "20"      # remove the # to check more portals per run (uses more Gemini quota)
+          MAX_PDFS_PER_PAGE: "2"                  # only used for visitor-question pages
+          MAX_DOWNLOADS_PER_PORTAL: "20"          # files looked at per portal (old files cost no Gemini)
+          MAX_GEMINI_PER_RUN: "40"                # PDFs sent to Gemini per run
+          MAX_GEMINI_PER_PORTAL: "3"              # PDFs sent to Gemini per portal
+          MAX_BROWSER_PAGES: "150"                # browser page loads per run
+          BROWSER_FIRST: "andamannicobar.gov.in"  # sites always also read in the real browser (comma separated)
+          # Filled from the "Run workflow" form (blank = use the plugin / default setting):
+          MAX_AGE_DAYS: ${{ inputs.max_age_days }}
+          FORCE_RECHECK: ${{ inputs.force_recheck }}
           # USE_BROWSER: "0"             # remove the # to switch the browser reader off
         run: |
           $ErrorActionPreference = 'Continue'
