@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """
-Sarkari Jobs Guide - Auto Notification Drafter  (v2: + visitor-question queue)
+Sarkari Jobs Guide - Auto Notification Drafter  (v3: + visitor-question queue, better coverage)
 ------------------------------------------------------------------------------
 1. Scans your list of government recruitment pages -> finds PDFs -> Gemini extracts details ->
    creates a WordPress post (draft by default) with JobPosting JSON-LD.
-2. NEW: reads the "Users' Queries" queue from your website (job questions your site could not answer),
+2. Reads the "Users' Queries" queue from your website (job questions your site could not answer),
    asks Gemini + Google Search for the official recruitment page, and makes a post from it,
    even when that website is NOT in the list below.
+
+What changed in v3:
+   - Old / non-job files are filtered out BEFORE the per-portal limit, so they no longer use up the slots
+     (this is why newest SBI notices were never reached).
+   - Newest-dated files are checked first.
+   - RRB style links (getdata?cennum=...) are recognised as documents.
+   - BROWSER_FIRST: sites whose list is built by JavaScript are always read in the real browser too.
+   - Browser page budget raised (150 per run).
+   - Missing comma in the fallback list fixed; duplicate portals removed.
 
 Setup:
     pip install requests beautifulsoup4 google-genai urllib3
@@ -14,16 +23,19 @@ Setup:
 Credentials come from environment variables (GitHub Secrets in Actions):
     WP_URL, WP_USERNAME, WP_APPLICATION_PASSWORD, GEMINI_API_KEY
 Optional:
-    GEMINI_MODEL            -> force a specific model, e.g. gemini-3.6-flash
-    MAX_PDFS_PER_PAGE       (default 5)
-    MAX_GEMINI_PER_RUN      (default 12) -> max PDFs sent to Gemini for the normal portal scan
-    MAX_GEMINI_PER_PORTAL   (default 2)  -> max PDFs sent to Gemini per portal, so one portal cannot use the whole budget
-    MAX_AGE_DAYS            (optional) -> overrides the age limit from the WordPress panel (e.g. 30)
-    USE_BROWSER             (default 1)  -> 0 switches the real-browser reader (Playwright) off
-    MAX_BROWSER_PAGES       (default 20) -> browser page loads per run
-    FORCE_RECHECK           (optional) -> parts of web addresses to check again even if seen before, e.g. mppsc.mp.gov.in
-    MAX_QUERIES_PER_RUN     (default 3) -> visitor questions handled per run
-    MAX_QUERY_PDFS_PER_RUN  (default 3) -> PDFs sent to Gemini for visitor questions per run
+    GEMINI_MODEL               -> force a specific model, e.g. gemini-3.6-flash
+    MAX_PDFS_PER_PAGE          (default 5)   -> used for visitor-question pages
+    MAX_DOWNLOADS_PER_PORTAL   (default 20)  -> files looked at per portal (old files cost no Gemini)
+    MAX_GEMINI_PER_RUN         (default 12)  -> max PDFs sent to Gemini for the normal portal scan
+    MAX_GEMINI_PER_PORTAL      (default 2)   -> max PDFs sent to Gemini per portal, so one portal cannot use the whole budget
+    MAX_AGE_DAYS               (optional)    -> overrides the age limit from the WordPress panel (e.g. 30)
+    USE_BROWSER                (default 1)   -> 0 switches the real-browser reader (Playwright) off
+    MAX_BROWSER_PAGES          (default 150) -> browser page loads per run
+    BROWSER_FIRST              (optional)    -> parts of host names that are always also read in the browser,
+                                                e.g. andamannicobar.gov.in,sbi.bank.in
+    FORCE_RECHECK              (optional)    -> parts of web addresses to check again even if seen before, e.g. mppsc.mp.gov.in
+    MAX_QUERIES_PER_RUN        (default 3)   -> visitor questions handled per run
+    MAX_QUERY_PDFS_PER_RUN     (default 3)   -> PDFs sent to Gemini for visitor questions per run
 """
 
 import io
@@ -64,6 +76,7 @@ if not (WP_USERNAME and WP_APP_PASSWORD and GEMINI_API_KEY):
 SEEN_FILE = "seen_notifications.json"
 REVIEW_LOG = "needs_review.log"
 MAX_PDFS_PER_PAGE = int(os.environ.get("MAX_PDFS_PER_PAGE", "5"))
+MAX_DOWNLOADS_PER_PORTAL = int(os.environ.get("MAX_DOWNLOADS_PER_PORTAL", "20"))
 MAX_GEMINI_PER_RUN = int(os.environ.get("MAX_GEMINI_PER_RUN", "12"))
 MAX_GEMINI_PER_PORTAL = int(os.environ.get("MAX_GEMINI_PER_PORTAL", "2"))
 MAX_QUERIES_PER_RUN = int(os.environ.get("MAX_QUERIES_PER_RUN", "3"))
@@ -315,14 +328,13 @@ FALLBACK_SETTINGS = {
         "https://police.rajasthan.gov.in/",
         "https://recruitment.itbpolice.nic.in/",
         "https://bpssc.bihar.gov.in/",
-        "https://csbc.bihar.gov.in/"
+        "https://csbc.bihar.gov.in/",
         "https://bpsc.bih.nic.in/",
         "https://psc.wb.gov.in/",
         "https://mpsc.gov.in/",
         "https://kpsc.kar.nic.in/",
         "https://tnpsc.gov.in/",
         "https://keralapsc.gov.in/",
-        "https://recruitment.itbpolice.nic.in/",
         "https://assamrifles.gov.in/onlineapp/",
         "https://joinindiancoastguard.cdac.in/",
         "https://indianairforce.nic.in/",
@@ -388,7 +400,7 @@ SESSION = make_session()
 
 LINK_HINTS = (".pdf", "download", "viewdoc", "getfile", "attachment", "showfile", "openfile",
               "fileview", "viewfile", "cmsfile", "viewdocument", "getdocument", "viewpdf", "openpdf", "showpdf",
-              "view_advertisement", "viewadvertisement")
+              "view_advertisement", "viewadvertisement", "getdata")
 
 
 _LINK_TEXT = {}       # link address -> the words shown on the page for it
@@ -399,17 +411,21 @@ _BROWSER_HOSTS = set()  # websites that only worked through the real browser
 # 3b. REAL BROWSER READER (optional, uses Playwright + the Chrome installed on this PC)
 #     Used only when the normal request is blocked (HTTP 403 etc.) or the page builds its list with
 #     JavaScript. If Playwright is not installed the script simply carries on without it.
-#     USE_BROWSER=0 switches it off; MAX_BROWSER_PAGES (default 12) limits browser page loads per run.
+#     USE_BROWSER=0 switches it off; MAX_BROWSER_PAGES (default 150) limits browser page loads per run.
+#     BROWSER_FIRST lists sites that are ALWAYS also read in the browser.
 # ---------------------------------------------------------------------------
 USE_BROWSER = os.environ.get("USE_BROWSER", "1").strip().lower() not in ("0", "false", "no", "off")
-MAX_BROWSER_PAGES = int(os.environ.get("MAX_BROWSER_PAGES", "20"))
+MAX_BROWSER_PAGES = int(os.environ.get("MAX_BROWSER_PAGES", "150"))
+# Sites whose list is built by JavaScript: always read them in the browser too,
+# e.g. "andamannicobar.gov.in,sbi.bank.in"
+BROWSER_FIRST = [x.strip().lower() for x in os.environ.get("BROWSER_FIRST", "").split(",") if x.strip()]
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 BLOCK_CODES = (401, 403, 406, 429, 503)
 
-# A "strong" link clearly points at a file (".pdf", "CMSFileView", ...). A word like "download" alone
+# A "strong" link clearly points at a file (".pdf", "CMSFileView", "getdata?...", ...). A word like "download" alone
 # (a menu item such as "Download Formats") is only a weak hint.
-STRONG_RE = re.compile(r"\.pdf(?:$|[?#])|fileview|cmsfile|viewfile|viewdocument|getdocument|viewdoc|showfile|"
+STRONG_RE = re.compile(r"\.pdf(?:$|[?#])|getdata\?|fileview|cmsfile|viewfile|viewdocument|getdocument|viewdoc|showfile|"
                        r"openfile|getfile|viewpdf|openpdf|showpdf|view_advertisement|viewadvertisement|attachment", re.I)
 CLICK_TEXT_RE = re.compile(r"view\s*pdf|download|click\s*here|view\s*(?:notice|advert|notification|detail)", re.I)
 _CLICK_PAGES = set()   # pages whose "View PDF" buttons run JavaScript; these are opened and clicked in the browser
@@ -471,7 +487,13 @@ def _browser_ready():
 def browser_html(url):
     """Rendered HTML of a page (after its JavaScript ran). Returns (html, final_url) or None."""
     global _browser_pages
-    if _browser_pages >= MAX_BROWSER_PAGES or not _browser_ready():
+    if _browser_pages >= MAX_BROWSER_PAGES:
+        if _browser_pages == MAX_BROWSER_PAGES:
+            log.warning(f"  Browser page budget ({MAX_BROWSER_PAGES}) used up; later pages are read without the browser. "
+                        f"Raise MAX_BROWSER_PAGES if needed.")
+            _browser_pages += 1          # warn only once
+        return None
+    if not _browser_ready():
         return None
     _browser_pages += 1
     page = None
@@ -703,8 +725,10 @@ def find_pdf_links(target_url):
     links, soup = ([], None)
     if html is not None:
         links, soup = _extract_doc_links(html, target_url)
-    if not any(STRONG_RE.search(l) for l in links):
-        # blocked (403 ...), a page that builds its list with JavaScript, or only a menu item like "Download"
+    force_browser = any(b in host for b in BROWSER_FIRST)
+    if force_browser or not any(STRONG_RE.search(l) for l in links):
+        # blocked (403 ...), a page that builds its list with JavaScript, only a menu item like "Download",
+        # or a site you listed in BROWSER_FIRST
         got = browser_html(target_url)
         if got:
             blinks, bsoup = _extract_doc_links(got[0], got[1] or target_url)
@@ -1492,6 +1516,25 @@ def looks_like_job_pdf(url):
     return not NOT_JOB_RE.search(name)
 
 
+def prefilter(candidates, cutoff, seen):
+    """Cheaply drop old and non-job files BEFORE the per-portal limit is applied, so they cannot use up
+    the slots, and put the newest-dated files first. Dropped files are remembered in the seen list."""
+    keep = []
+    now = datetime.now().isoformat(timespec="seconds")
+    for p in candidates:
+        if not looks_like_job_pdf(p):
+            seen[f"url:{p}"] = now
+            continue
+        nd = date_in_name(p)
+        if nd and nd < cutoff - timedelta(days=14):
+            seen[f"url:{p}"] = f"old:{nd + timedelta(days=14):%Y-%m-%d}"
+            continue
+        keep.append((nd, p))
+    dated = sorted([k for k in keep if k[0]], key=lambda t: t[0], reverse=True)
+    undated = [k for k in keep if not k[0]]
+    return [p for _, p in dated + undated]
+
+
 def find_pdf_links_deep(page_url, max_sub=3):
     """PDF links on the page; if there are none, also look one level down on the same website
     (links such as 'Recruitment', 'Careers', 'Advertisement', 'Notifications')."""
@@ -1607,10 +1650,13 @@ def main():
     if post_status not in ("draft", "pending", "publish", "private"):
         post_status = "draft"
     target_urls = settings.get("target_urls") or FALLBACK_SETTINGS["target_urls"]
+    target_urls = list(dict.fromkeys(u.strip() for u in target_urls if u and u.strip()))   # drop blanks / duplicates
     cutoff = datetime.now() - timedelta(days=max_days)
 
     log.info(f"Engine started | age limit: {max_days} days | status: {post_status} | "
-             f"{len(target_urls)} portals | Gemini cap: {MAX_GEMINI_PER_RUN}/run")
+             f"{len(target_urls)} portals | Gemini cap: {MAX_GEMINI_PER_RUN}/run | "
+             f"browser pages: {MAX_BROWSER_PAGES} | browser-first: {BROWSER_FIRST or 'none'} | "
+             f"force recheck: {FORCE_RECHECK or 'none'}")
 
     stats = {"created": 0, "skipped": 0, "errors": 0, "gemini": 0}
     seen = load_seen()
@@ -1634,18 +1680,22 @@ def main():
             for idx in order:
                 url = target_urls[idx]
                 links = find_pdf_links(url)
-                candidates = [p for p in links if not is_seen(seen, f"url:{p}", cutoff, p)]
+                unseen = [p for p in links if not is_seen(seen, f"url:{p}", cutoff, p)]
+                candidates = prefilter(unseen, cutoff, seen)     # old / non-job files no longer use up the slots
+                save_seen(seen)
                 host = (urlparse(url).hostname or "").lower()
                 if host in _dead_hosts:
                     report[url] = "UNREACHABLE from this server (blocked or timed out)"
                 elif not links and url not in _CLICK_PAGES:
                     report[url] = "no document links found (JavaScript page?)"
                 else:
-                    report[url] = f"{len(candidates)} new of {len(links)} links"
-                log.info(f"  {len(candidates)} new document link(s) on this page.")
+                    report[url] = (f"{len(candidates)} to check | {len(unseen)} unseen | "
+                                   f"{len(links)} total links")
+                log.info(f"  {len(candidates)} document link(s) to check on this page "
+                         f"({len(unseen)} unseen, {len(links)} total).")
                 used = 0
                 created_before = stats["created"]
-                for pdf_url in candidates[:MAX_PDFS_PER_PAGE * 3]:
+                for pdf_url in candidates[:MAX_DOWNLOADS_PER_PORTAL]:
                     g0 = stats["gemini"]
                     process_pdf(pdf_url, url, cutoff, post_status, seen, stats)
                     used += stats["gemini"] - g0
