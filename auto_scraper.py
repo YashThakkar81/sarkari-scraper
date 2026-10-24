@@ -316,6 +316,22 @@ FALLBACK_SETTINGS = {
         "https://recruitment.itbpolice.nic.in/",
         "https://bpssc.bihar.gov.in/",
         "https://csbc.bihar.gov.in/"
+        "https://bpsc.bih.nic.in/",
+        "https://psc.wb.gov.in/",
+        "https://mpsc.gov.in/",
+        "https://kpsc.kar.nic.in/",
+        "https://tnpsc.gov.in/",
+        "https://keralapsc.gov.in/",
+        "https://recruitment.itbpolice.nic.in/",
+        "https://assamrifles.gov.in/onlineapp/",
+        "https://joinindiancoastguard.cdac.in/",
+        "https://indianairforce.nic.in/",
+        "https://careers.ntpc.co.in/",
+        "https://careers.bhel.in/",
+        "https://iocl.com/pages/latest-job-openings",
+        "https://www.powergrid.in/job-opportunities",
+        "https://aiimsexams.ac.in/",
+        "https://nhm.gov.in/"
     ],
 }
 
